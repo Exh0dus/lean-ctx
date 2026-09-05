@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 
@@ -140,6 +141,33 @@ class PythonEngineWheelTests(unittest.TestCase):
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, workflow)
+
+    def test_read_regular_requests_binary_mode(self):
+        payload = b"MZ\r\n\x1a\x00lean-ctx\r\n"
+        self.binary.write_bytes(payload)
+        self.assertEqual(
+            MODULE._read_regular(self.binary, maximum=1024, label="binary"),
+            payload,
+        )
+
+        original_open = MODULE.os.open
+        binary_flag = 1 << 29
+
+        def open_without_synthetic_flag(path, flags):
+            return original_open(path, flags & ~binary_flag)
+
+        with (
+            mock.patch.object(MODULE.os, "O_BINARY", binary_flag, create=True),
+            mock.patch.object(
+                MODULE.os, "open", side_effect=open_without_synthetic_flag
+            ) as mocked_open,
+        ):
+            self.assertEqual(
+                MODULE._read_regular(self.binary, maximum=1024, label="binary"),
+                self.binary.read_bytes(),
+            )
+
+        self.assertTrue(mocked_open.call_args.args[1] & binary_flag)
 
     def test_release_uses_system_allocator_on_musl(self):
         manifest = (ROOT / "rust" / "Cargo.toml").read_text(encoding="utf-8")

@@ -9,6 +9,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed — release packaging
 
+- Windows Engine companion wheels now read `.exe` payloads in binary mode,
+  avoiding false truncation errors when binaries contain the DOS EOF byte
+  (`0x1A`).
 - Linux musl release builds now use the platform system allocator instead of
   compiling jemalloc, avoiding its C11-atomics incompatibility on supported
   musl runners. glibc Linux and macOS builds continue to use jemalloc.

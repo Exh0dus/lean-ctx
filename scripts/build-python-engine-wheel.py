@@ -38,7 +38,12 @@ def _read_regular(path: Path, *, maximum: int, label: str) -> bytes:
         raise ValueError(f"{label} must be a regular non-symlink file")
     if initial.st_size <= 0 or initial.st_size > maximum:
         raise ValueError(f"{label} size is outside the release bounds")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
