@@ -12,6 +12,7 @@ mod learning;
 mod memory;
 mod risk;
 mod roi;
+pub(super) mod runs;
 mod settings;
 mod signals;
 mod snapshots;
@@ -27,6 +28,7 @@ fn match_component_path(path: &str) -> Option<String> {
         "/static/components/cockpit-nav.js" => super::COCKPIT_COMPONENT_NAV_JS,
         "/static/components/cockpit-context.js" => super::COCKPIT_COMPONENT_CONTEXT_JS,
         "/static/components/cockpit-overview.js" => super::COCKPIT_COMPONENT_OVERVIEW_JS,
+        "/static/components/cockpit-runs.js" => super::COCKPIT_COMPONENT_RUNS_JS,
         "/static/components/cockpit-live.js" => super::COCKPIT_COMPONENT_LIVE_JS,
         "/static/components/cockpit-knowledge.js" => super::COCKPIT_COMPONENT_KNOWLEDGE_JS,
         "/static/components/cockpit-agents.js" => super::COCKPIT_COMPONENT_AGENTS_JS,
@@ -61,7 +63,12 @@ pub fn route_response(
     method: &str,
     body: &str,
 ) -> (&'static str, &'static str, String) {
-    if path == "/" || path == "/index.html" || path == "/cockpit" || path == "/cockpit/" {
+    if path == "/"
+        || path == "/index.html"
+        || path == "/cockpit"
+        || path == "/cockpit/"
+        || runs::is_run_page(path)
+    {
         let mut html = super::COCKPIT_INDEX_HTML.to_string();
         if let Some(t) = token {
             let expected = t.as_str();
@@ -162,6 +169,7 @@ pub fn route_response(
     }
 
     stats::handle(path, query_str, method, body)
+        .or_else(|| runs::handle(path))
         .or_else(|| signals::handle(path, query_str, method, body))
         .or_else(|| context::handle(path, query_str, method, body))
         .or_else(|| risk::handle(path, query_str, method, body))

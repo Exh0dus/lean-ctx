@@ -257,6 +257,7 @@
 <script type="module" src="/static/components/cockpit-nav.js"></script>
 <script type="module" src="/static/components/cockpit-context.js"></script>
 <script type="module" src="/static/components/cockpit-overview.js"></script>
+<script type="module" src="/static/components/cockpit-runs.js"></script>
 <script type="module" src="/static/components/cockpit-live.js"></script>
 <script type="module" src="/static/components/cockpit-knowledge.js"></script>
 <script type="module" src="/static/components/cockpit-agents.js"></script>
@@ -277,6 +278,7 @@
 <script type="module" src="/static/components/cockpit-area-tabs.js"></script>
 <script type="module" src="/static/components/cockpit-protection.js"></script>
 <script type="module" src="/static/components/cockpit-settings.js"></script>
+<style>html.lctx-embed .support-bar,html.lctx-embed .sidebar,html.lctx-embed #topbar,html.lctx-embed #cockpitStatusBar,html.lctx-embed #viewHint{display:none!important}html.lctx-embed .app-layout{padding-top:0}html.lctx-embed .main{margin-left:0!important}html.lctx-embed .content-container{max-width:none;padding:16px}</style>
 </head>
 <body class="cockpit-shell-styles">
 <div class="support-bar" id="supportBar" role="region" aria-label="Support lean-ctx">
@@ -401,6 +403,7 @@
     </div>
 
     <section id="view-overview" class="view active">
+      <cockpit-runs id="runsView"></cockpit-runs>
       <cockpit-overview id="overviewView"></cockpit-overview>
     </section>
     <section id="view-commander" class="view">

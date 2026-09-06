@@ -53,7 +53,7 @@ pub fn rewrite_asset_urls(body: &str, base: &str) -> String {
     }
     // Root-absolute prefixes used by the dashboard. `/favicon` has no trailing
     // slash on purpose (covers both `/favicon.svg` and `/favicon.ico`).
-    const PREFIXES: &[&str] = &["/static/", "/api/", "/favicon"];
+    const PREFIXES: &[&str] = &["/static/", "/api/", "/runs/", "/favicon"];
     // Delimiters that introduce a URL literal in HTML attributes, JS string and
     // template literals, and CSS `url(...)`.
     const DELIMS: &[char] = &['"', '\'', '`', '('];
@@ -135,11 +135,12 @@ mod tests {
 
     #[test]
     fn rewrite_js_string_and_template_literals() {
-        let js = "fetch('/api/stats'); const u = `/api/search?q=${q}`; api('/api/pulse');";
+        let js = "fetch('/api/stats'); const u = `/api/search?q=${q}`; api('/api/pulse'); location.assign('/runs/abc');";
         let out = rewrite_asset_urls(js, "/dashboard");
         assert!(out.contains("fetch('/dashboard/api/stats')"));
         assert!(out.contains("`/dashboard/api/search?q=${q}`"));
         assert!(out.contains("api('/dashboard/api/pulse')"));
+        assert!(out.contains("location.assign('/dashboard/runs/abc')"));
     }
 
     #[test]

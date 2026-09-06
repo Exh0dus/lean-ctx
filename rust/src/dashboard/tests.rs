@@ -128,6 +128,76 @@ fn api_path_detection() {
 }
 
 #[test]
+fn broker_runs_asset_and_html_are_registered() {
+    let namespace = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let (status, content_type, body) = routes::route_response(
+        "/static/components/cockpit-runs.js",
+        "",
+        None,
+        None,
+        true,
+        "GET",
+        "",
+    );
+    assert_eq!(status, "200 OK");
+    assert_eq!(content_type, "application/javascript; charset=utf-8");
+    assert!(body.contains("customElements.define('cockpit-runs'"));
+
+    for path in [format!("/runs/{namespace}"), format!("/runs/{namespace}/")] {
+        let (status, content_type, body) =
+            routes::route_response(&path, "", None, None, true, "GET", "");
+        assert_eq!(status, "200 OK");
+        assert_eq!(content_type, "text/html; charset=utf-8");
+        assert!(body.contains("<cockpit-runs"));
+    }
+}
+
+#[test]
+fn frame_embedding_is_deny_by_default_and_narrowly_opt_in() {
+    let _env_lock = crate::core::data_dir::test_env_lock();
+    let namespace = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let run_path = format!("/runs/{namespace}");
+    crate::test_env::remove_var(FRAME_ANCESTORS_ENV);
+
+    let headers = security_headers(&run_path, "embed=1", "nonce");
+    assert!(headers.contains("X-Frame-Options: DENY"));
+    assert!(!headers.contains("frame-ancestors"));
+
+    crate::test_env::set_var(
+        FRAME_ANCESTORS_ENV,
+        "http://oms.loc, https://console.example:8443/",
+    );
+    let headers = security_headers(&run_path, "embed=1", "nonce");
+    assert!(!headers.contains("X-Frame-Options"));
+    assert!(headers.contains("frame-ancestors http://oms.loc https://console.example:8443"));
+
+    for (path, query) in [
+        (run_path.as_str(), ""),
+        (run_path.as_str(), "embed=0"),
+        ("/", "embed=1"),
+        ("/api/runs", "embed=1"),
+    ] {
+        let headers = security_headers(path, query, "nonce");
+        assert!(headers.contains("X-Frame-Options: DENY"));
+        assert!(!headers.contains("frame-ancestors"));
+    }
+
+    for invalid in [
+        "file:///tmp",
+        "https://oms.loc/path",
+        "https://user@oms.loc",
+        "https://oms.loc; frame-src *",
+        "https://oms.loc\nX-Test: injected",
+    ] {
+        crate::test_env::set_var(FRAME_ANCESTORS_ENV, invalid);
+        let headers = security_headers(&run_path, "embed=1", "nonce");
+        assert!(headers.contains("X-Frame-Options: DENY"), "{invalid}");
+        assert!(!headers.contains("frame-ancestors"), "{invalid}");
+    }
+    crate::test_env::remove_var(FRAME_ANCESTORS_ENV);
+}
+
+#[test]
 fn api_session_exposes_unmodified_session_stats() {
     let _iso = crate::core::data_dir::isolated_data_dir();
 

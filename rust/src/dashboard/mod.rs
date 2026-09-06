@@ -16,6 +16,7 @@ const COCKPIT_LIB_DOCTOR_JS: &str = include_str!("static/lib/doctor.js");
 const COCKPIT_COMPONENT_NAV_JS: &str = include_str!("static/components/cockpit-nav.js");
 const COCKPIT_COMPONENT_CONTEXT_JS: &str = include_str!("static/components/cockpit-context.js");
 const COCKPIT_COMPONENT_OVERVIEW_JS: &str = include_str!("static/components/cockpit-overview.js");
+const COCKPIT_COMPONENT_RUNS_JS: &str = include_str!("static/components/cockpit-runs.js");
 const COCKPIT_COMPONENT_LIVE_JS: &str = include_str!("static/components/cockpit-live.js");
 const COCKPIT_COMPONENT_KNOWLEDGE_JS: &str = include_str!("static/components/cockpit-knowledge.js");
 const COCKPIT_COMPONENT_AGENTS_JS: &str = include_str!("static/components/cockpit-agents.js");
@@ -653,6 +654,7 @@ pub(crate) fn dashboard_responding(host: &str, port: u16) -> bool {
 }
 
 const MAX_HTTP_MESSAGE: usize = 2 * 1024 * 1024;
+const FRAME_ANCESTORS_ENV: &str = "LEAN_CTX_DASHBOARD_FRAME_ANCESTORS";
 
 fn header_line_value<'a>(header_section: &'a str, name: &str) -> Option<&'a str> {
     for line in header_section.lines() {
@@ -908,6 +910,8 @@ async fn handle_request(
     // a `JoinError`), so the previous `catch_unwind` is no longer needed.
     let route_started = std::time::Instant::now();
     let route_label = path.clone();
+    let security_path = path.clone();
+    let security_query = query_str.clone();
     let compute = tokio::task::spawn_blocking(move || {
         routes::route_response(
             &path,
@@ -977,12 +981,7 @@ async fn handle_request(
     if content_type.contains("text/html") {
         body = add_nonce_to_inline_scripts(&body, &nonce);
     }
-    let security_headers = format!(
-        "X-Content-Type-Options: nosniff\r\n\
-         X-Frame-Options: DENY\r\n\
-         Referrer-Policy: no-referrer\r\n\
-         Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'\r\n"
-    );
+    let security_headers = security_headers(&security_path, &security_query, &nonce);
 
     let response = format!(
         "HTTP/1.1 {status}\r\n\
@@ -997,6 +996,59 @@ async fn handle_request(
     );
 
     let _ = stream.write_all(response.as_bytes()).await;
+}
+
+fn security_headers(path: &str, query: &str, nonce: &str) -> String {
+    let frame_ancestors = if routes::runs::is_run_page(path) && query_has_embed(query) {
+        configured_frame_ancestors()
+    } else {
+        None
+    };
+    let (frame_header, frame_directive) = match frame_ancestors {
+        Some(origins) => (String::new(), format!("; frame-ancestors {origins}")),
+        None => ("X-Frame-Options: DENY\r\n".to_string(), String::new()),
+    };
+    format!(
+        "X-Content-Type-Options: nosniff\r\n\
+         {frame_header}\
+         Referrer-Policy: no-referrer\r\n\
+         Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'{frame_directive}\r\n"
+    )
+}
+
+fn query_has_embed(query: &str) -> bool {
+    query.split('&').any(|pair| {
+        pair.split_once('=')
+            .is_some_and(|(key, value)| key == "embed" && value == "1")
+    })
+}
+
+fn configured_frame_ancestors() -> Option<String> {
+    let configured = std::env::var(FRAME_ANCESTORS_ENV).ok()?;
+    if configured.is_empty() || configured.len() > 2048 || configured.contains(['\r', '\n', ';']) {
+        return None;
+    }
+    let mut origins = Vec::new();
+    for candidate in configured.split(',') {
+        let candidate = candidate.trim();
+        if candidate.is_empty() || origins.len() >= 16 {
+            return None;
+        }
+        let uri: http::Uri = candidate.parse().ok()?;
+        let scheme = uri.scheme_str()?;
+        if !matches!(scheme, "http" | "https") || uri.query().is_some() {
+            return None;
+        }
+        let authority = uri.authority()?.as_str();
+        if authority.contains('@') || (uri.path() != "/" && !uri.path().is_empty()) {
+            return None;
+        }
+        let origin = format!("{scheme}://{authority}");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    (!origins.is_empty()).then(|| origins.join(" "))
 }
 
 fn check_auth(request: &str, expected_token: &str) -> bool {

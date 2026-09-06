@@ -388,7 +388,7 @@ function initRouter() {
     }
   }
   window.addEventListener('hashchange', onHashChange);
-  if (!window.location.hash || window.location.hash === '#') {
+  if ((!window.location.hash || window.location.hash === '#') && !window.location.pathname.match(/\/runs\/[0-9a-f]{64}\/?$/i)) {
     var url = new URL(window.location.href);
     url.hash = '#overview';
     history.replaceState(null, '', url.pathname + url.search + url.hash);
