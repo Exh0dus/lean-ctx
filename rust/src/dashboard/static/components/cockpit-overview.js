@@ -842,6 +842,7 @@ class CockpitOverview extends HTMLElement {
         var val = parseInt(btn.getAttribute('data-range'), 10);
         if (isNaN(val)) val = 0;
         self._range = val;
+        try { document.dispatchEvent(new CustomEvent('lctx:runs-range', { detail: { days: val } })); } catch (_) {}
         self._stopAnim();
         self._destroyCharts();
         self.render();

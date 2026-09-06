@@ -16,7 +16,7 @@ class HTMLElement {
 const context = {
   console, HTMLElement, customElements: { define() {} },
   document: { body: { classList: { add() {}, remove() {}, toggle() {} } }, getElementById() { return null; } },
-  window: { location: { pathname: '/cockpit/', search: '?embed=1', hash: '' }, addEventListener() {}, removeEventListener() {}, LctxApi: {} },
+  window: { location: { pathname: '/cockpit/', search: '?embed=1', hash: '' }, addEventListener() {}, removeEventListener() {}, LctxApi: { apiFetch() {} } },
   setInterval() { return 1; }, clearInterval() {}, history: { pushState() {} },
 };
 context.globalThis = context;
@@ -27,6 +27,18 @@ if (context.normalizedBasePath() !== '/cockpit') throw new Error('base path was 
 if (context.routePath(namespace) !== '/cockpit/runs/' + namespace) throw new Error('base path escaped');
 
 const runs = new context.CockpitRuns();
+runs._range = 7;
+if (runs._apiPath('') !== '/cockpit/api/runs?days=7') throw new Error('range query missing');
+runs._range = 30;
+if (runs._apiPath(namespace) !== '/cockpit/api/runs/' + namespace + '?days=30') throw new Error('detail range query missing');
+runs._inflight = true;
+runs._onRangeChange({ detail: { days: 7 } });
+if (runs._range !== 7 || !runs._reloadPending || runs._reloadQuiet) {
+  throw new Error('range change did not queue a visible replacement load');
+}
+runs._inflight = false;
+runs._reloadPending = false;
+runs._reloadQuiet = true;
 runs._runs = [{ namespace, task_id: 'task-1', assignment_id: 'assignment-1', member_id: 'member-1',
   status: 'active', metrics: { requests_total: 4, tokens_saved_total: 9,
     tokens_processed: 12, source: 'live' } }];
@@ -34,7 +46,7 @@ runs._aggregate = { total_runs: 1, tokens_saved_total: 9 };
 runs._enabled = true;
 runs._loading = false;
 runs.render();
-if (!runs.innerHTML.includes('All runs') || !runs.innerHTML.includes(namespace) ||
+if (!runs.innerHTML.includes('7 days') || !runs.innerHTML.includes(namespace) ||
     !runs.innerHTML.includes('<strong>1</strong><span>Runs</span>') ||
     !runs.innerHTML.includes('active - live')) throw new Error('aggregate payload did not render');
 runs._detail = runs._runs[0];

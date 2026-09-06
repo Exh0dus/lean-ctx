@@ -169,7 +169,7 @@ pub fn route_response(
     }
 
     stats::handle(path, query_str, method, body)
-        .or_else(|| runs::handle(path))
+        .or_else(|| runs::handle(path, query_str))
         .or_else(|| signals::handle(path, query_str, method, body))
         .or_else(|| context::handle(path, query_str, method, body))
         .or_else(|| risk::handle(path, query_str, method, body))

@@ -65,8 +65,15 @@ class CockpitRuns extends HTMLElement {
     this._detailError = null;
     this._openNew = false;
     this._sort = 'recent';
+    this._range = 30;
     this._generation = 0;
+    this._inflight = false;
+    this._reloadPending = false;
+    this._reloadQuiet = true;
+    this._retryAttempt = 0;
+    this._retryTimer = null;
     this._onPopState = this._onPopState.bind(this);
+    this._onRangeChange = this._onRangeChange.bind(this);
   }
 
   connectedCallback() {
@@ -78,6 +85,7 @@ class CockpitRuns extends HTMLElement {
       document.body.classList.add('lctx-embed' );
     }
     window.addEventListener('popstate', this._onPopState);
+    document.addEventListener('lctx:runs-range', this._onRangeChange);
     this._syncPath();
     this.loadData();
     this._timer = setInterval(() => this.loadData(true), 15000);
@@ -85,11 +93,24 @@ class CockpitRuns extends HTMLElement {
 
   disconnectedCallback() {
     window.removeEventListener('popstate', this._onPopState);
+    document.removeEventListener('lctx:runs-range', this._onRangeChange);
     if (this._timer) clearInterval(this._timer);
+    if (this._retryTimer) clearTimeout(this._retryTimer);
   }
 
   _onPopState() {
     this._syncPath();
+    this._generation++;
+    this.loadData();
+  }
+
+  _onRangeChange(event) {
+    const days = Number(event && event.detail && event.detail.days);
+    if (![0, 7, 30, 90].includes(days) || days === this._range) return;
+    this._range = days;
+    this._generation++;
+    this._retryAttempt = 0;
+    if (this._retryTimer) clearTimeout(this._retryTimer);
     this.loadData();
   }
 
@@ -111,12 +132,19 @@ class CockpitRuns extends HTMLElement {
     }
     history.pushState({ run: selected || null }, '', url + query + hash);
     this._syncPath();
+    this._generation++;
     this.loadData();
   }
 
   async loadData(quiet) {
     const fetchJson = runsApi();
     if (!fetchJson) return;
+    if (this._inflight) {
+      this._reloadPending = true;
+      this._reloadQuiet = this._reloadQuiet && !!quiet;
+      return;
+    }
+    this._inflight = true;
     const generation = ++this._generation;
     if (!quiet) {
       this._loading = true;
@@ -127,15 +155,17 @@ class CockpitRuns extends HTMLElement {
     this._detail = null;
     this._detailError = null;
     try {
-      const index = await fetchJson(this._apiPath(''));
-      if (generation !== this._generation) return;
+      const index = await fetchJson(this._apiPath(''), { timeoutMs: 15000 });
+      if (generation !== this._generation) { this._finishLoad(); return; }
       if (!index || typeof index !== 'object' || typeof index.enabled !== 'boolean') {
         this._enabled = null;
         this._runs = [];
         this._aggregate = null;
         this._error = 'Run history response is unavailable or malformed';
         this._loading = false;
+        this._scheduleRetry();
         this.render();
+        this._finishLoad();
         return;
       }
       this._enabled = index.enabled;
@@ -146,34 +176,65 @@ class CockpitRuns extends HTMLElement {
         this._selected = null;
         this._loading = false;
         this.render();
+        this._finishLoad();
         return;
       }
       if (this._selected) {
         try {
           const detail = await fetchJson(this._apiPath(this._selected));
-          if (generation !== this._generation) return;
+          if (generation !== this._generation) { this._finishLoad(); return; }
           this._detail = detail && typeof detail === 'object' ? detail : null;
         } catch (error) {
-          if (generation !== this._generation) return;
+          if (generation !== this._generation) { this._finishLoad(); return; }
           this._detailError = error && error.error
             ? String(error.error) : 'Unable to load the selected run';
         }
       }
-      if (generation !== this._generation) return;
+      if (generation !== this._generation) { this._finishLoad(); return; }
       this._loading = false;
       this._error = null;
+      this._retryAttempt = 0;
+      if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
     } catch (error) {
-      if (generation !== this._generation) return;
+      if (generation !== this._generation) { this._finishLoad(); return; }
       this._loading = false;
       this._error = error && error.error
         ? String(error.error) : 'Run history is unavailable';
+      this._scheduleRetry();
     }
+    this._finishLoad();
     this.render();
+  }
+
+  _finishLoad() {
+    this._inflight = false;
+    if (!this._reloadPending) return;
+    const quiet = this._reloadQuiet;
+    this._reloadPending = false;
+    this._reloadQuiet = true;
+    Promise.resolve().then(() => this.loadData(quiet));
+  }
+
+  _scheduleRetry() {
+    if (this._retryTimer) return;
+    const delays = [2000, 5000, 10000, 15000];
+    const delay = delays[Math.min(this._retryAttempt++, delays.length - 1)];
+    this._retryTimer = setTimeout(() => {
+      this._retryTimer = null;
+      this.loadData(true);
+    }, delay);
+  }
+
+  _retryNow() {
+    this._retryAttempt = 0;
+    if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+    this.loadData();
   }
 
   _apiPath(namespace) {
     const base = normalizedBasePath();
-    return base + '/api/runs' + (namespace ? '/' + encodeURIComponent(namespace) : '');
+    return base + '/api/runs' + (namespace ? '/' + encodeURIComponent(namespace) : '') +
+      '?days=' + encodeURIComponent(String(this._range));
   }
 
   _ordered() {
@@ -227,8 +288,9 @@ class CockpitRuns extends HTMLElement {
   _aggregateView() {
     const aggregate = this._aggregate || {};
     const runCount = metric(aggregate, 'total_runs');
+    const rangeLabel = this._range === 0 ? 'All time' : this._range + ' days';
     let html = '<div class="runs-overview-head"><div><p class="eyebrow">BROKER RUNS</p>' +
-      '<h2>All runs</h2><p class="hs">Historical and active LeanCtx assignment runs.</p>' +
+      '<h2>' + escapeHtml(rangeLabel) + '</h2><p class="hs">Historical and active LeanCtx assignment runs.</p>' +
       '</div><div class="runs-totals"><div><strong>' +
       displayValue(runCount) + '</strong><span>Runs</span></div><div><strong>' +
       displayValue(metric(aggregate, 'tokens_saved_total')) +
@@ -293,7 +355,10 @@ class CockpitRuns extends HTMLElement {
       return;
     }
     if (this._error) {
-      this.innerHTML = this._stateCard('UNAVAILABLE', this._error, 'runs-unavailable');
+      this.innerHTML = this._stateCard('UNAVAILABLE', this._error, 'runs-unavailable') +
+        '<button type="button" class="runs-back" id="runsRetry">Retry now</button>';
+      const retry = this.querySelector('#runsRetry');
+      if (retry) retry.addEventListener('click', () => this._retryNow());
       return;
     }
     this.innerHTML = this._selector() +

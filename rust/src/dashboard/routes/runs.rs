@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 const ROOT_ENV: &str = "LEANCTX_ASSIGNMENTD_ROOT";
 const MAX_BROKER_JSON: u64 = 2 * 1024 * 1024;
@@ -13,6 +15,13 @@ const MAX_STATUS_JSON: u64 = 64 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_MEMBERS: usize = 4096;
 const NAMESPACE_LEN: usize = 64;
+const CACHE_SCHEMA: u32 = 1;
+const CACHE_DIR: &str = "dashboard-run-cache";
+const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_RUN_CACHE_FILES: usize = 512;
+const MAX_AGGREGATE_CACHE_FILES: usize = 32;
+static LIST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 type RouteResponse = (&'static str, &'static str, String);
 
@@ -208,9 +217,9 @@ fn add_measured(total: &mut Option<u64>, measured_runs: &mut u64, value: Option<
     }
 }
 
-pub(super) fn handle(path: &str) -> Option<RouteResponse> {
+pub(super) fn handle(path: &str, query: &str) -> Option<RouteResponse> {
     if path == "/api/runs" || path == "/api/runs/" {
-        return Some(match list_runs() {
+        return Some(match list_runs(parse_range(query)) {
             Ok(value) => ok(value),
             Err(error) => error.response(None),
         });
@@ -287,23 +296,370 @@ fn map_io_error(error: io::Error) -> DataError {
     }
 }
 
-fn list_runs() -> Result<Value, DataError> {
+#[derive(Clone, Copy)]
+struct RunWindow {
+    days: u32,
+    cutoff_day: i64,
+}
+
+fn parse_range(query: &str) -> RunWindow {
+    let requested = query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        (key == "days").then(|| value.parse::<u32>().ok()).flatten()
+    });
+    let days = match requested {
+        Some(0 | 7 | 30 | 90) => requested.unwrap_or(30),
+        _ => 30,
+    };
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        / 86_400;
+    RunWindow {
+        days,
+        cutoff_day: if days == 0 {
+            0
+        } else {
+            today.saturating_sub(i64::from(days - 1))
+        },
+    }
+}
+
+fn timestamp_day(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp().div_euclid(86_400))
+}
+
+fn included_in_window(assignment: &Assignment, window: RunWindow) -> bool {
+    if window.days == 0 {
+        return true;
+    }
+    timestamp_day(assignment.last_seen_at.as_deref())
+        .or_else(|| timestamp_day(assignment.created_at.as_deref()))
+        .is_some_and(|day| day >= window.cutoff_day)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunCacheFile {
+    schema: u32,
+    key: String,
+    fingerprint: String,
+    projection_sha256: String,
+    projection: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AggregateCacheFile {
+    schema: u32,
+    chain: String,
+    days: u32,
+    cutoff_day: i64,
+    run_keys: Vec<String>,
+    response_sha256: String,
+    response: Value,
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn digest_text(value: &str) -> String {
+    digest_bytes(value.as_bytes())
+}
+
+fn cache_dir(root: &Path) -> PathBuf {
+    root.join(CACHE_DIR)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(error)
+        }
+    }
+}
+
+fn bounded_cache_read(path: &Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CACHE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_CACHE_BYTES).then_some(bytes)
+}
+
+fn cache_file_key(fingerprint: &str) -> String {
+    digest_text(&format!("leanctx-run-cache-v{CACHE_SCHEMA}:{fingerprint}"))
+}
+
+fn cache_projection(
+    root: &Path,
+    fingerprint: &str,
+    projection: Option<Value>,
+) -> (String, Value, bool) {
+    let key = cache_file_key(fingerprint);
+    let dir = cache_dir(root);
+    let path = dir.join(format!("run-{key}.json"));
+    if let Some(bytes) = bounded_cache_read(&path) {
+        if let Ok(file) = serde_json::from_slice::<RunCacheFile>(&bytes) {
+            let projection_sha256 = serde_json::to_vec(&file.projection)
+                .ok()
+                .map(|bytes| digest_bytes(&bytes));
+            if file.schema == CACHE_SCHEMA
+                && file.key == key
+                && file.fingerprint == fingerprint
+                && projection_sha256.as_deref() == Some(file.projection_sha256.as_str())
+            {
+                return (key, file.projection, true);
+            }
+        }
+    }
+    let projection = projection.unwrap_or_else(|| json!({}));
+    let projection_sha256 = serde_json::to_vec(&projection)
+        .map(|bytes| digest_bytes(&bytes))
+        .unwrap_or_default();
+    let file = RunCacheFile {
+        schema: CACHE_SCHEMA,
+        key: key.clone(),
+        fingerprint: fingerprint.to_string(),
+        projection_sha256,
+        projection: projection.clone(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&file) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = atomic_write(&path, &bytes);
+        prune_cache(&dir, "run-", MAX_RUN_CACHE_FILES);
+    }
+    (key, projection, false)
+}
+
+fn prune_cache(dir: &Path, prefix: &str, keep: usize) {
+    let mut files: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .filter_map(|entry| {
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some((modified, entry.path()))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    files.sort_by_key(|(modified, _)| *modified);
+    while files.len() > keep {
+        if let Some((_, path)) = files.first() {
+            let _ = std::fs::remove_file(path);
+        }
+        files.remove(0);
+    }
+}
+
+fn live_file_fingerprint(path: &Path) -> String {
+    match read_bounded_json(path, MAX_STATUS_JSON) {
+        Ok(bytes) => digest_bytes(&bytes),
+        Err(DataError::Malformed) => "malformed".to_string(),
+        Err(_) => "missing".to_string(),
+    }
+}
+
+fn assignment_fingerprint(root: &Path, broker: &BrokerDocument, assignment: &Assignment) -> String {
+    if assignment.status == "archived" {
+        let inventory = broker.archives.iter().find(|archive| {
+            archive.archive_id == assignment.archive_id.as_deref().unwrap_or("")
+                && archive.task_id == assignment.task_id
+                && archive.assignment_id == assignment.assignment_id
+                && archive.member_id == assignment.member_id
+                && archive.namespace == assignment.namespace
+        });
+        return format!(
+            "archived|{}|{}|{}|{}|{}|{}|{}|{}",
+            assignment.namespace,
+            assignment.task_id,
+            assignment.assignment_id,
+            assignment.member_id,
+            assignment.archive_id.as_deref().unwrap_or(""),
+            inventory
+                .map(|value| value.path.to_string_lossy())
+                .unwrap_or_default(),
+            inventory.map(|value| value.sha256.as_str()).unwrap_or(""),
+            inventory
+                .map(|value| value.archive_state.as_str())
+                .unwrap_or("")
+        );
+    }
+    let data = root
+        .join("assignments")
+        .join(&assignment.namespace)
+        .join("data");
+    format!(
+        "live|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        assignment.namespace,
+        assignment.task_id,
+        assignment.assignment_id,
+        assignment.member_id,
+        assignment.status,
+        assignment.archive_state.as_deref().unwrap_or(""),
+        assignment.created_at.as_deref().unwrap_or(""),
+        live_file_fingerprint(&data.join("proxy_metrics.json")),
+        live_file_fingerprint(&data.join("proxy-introspect.json"))
+    )
+}
+
+fn aggregate_from_projection(value: &Value, aggregate: &mut Aggregate) {
+    let Some(metrics) = value.get("metrics") else {
+        return;
+    };
+    aggregate.total_runs = aggregate.total_runs.saturating_add(1);
+    match metrics.get("status").and_then(Value::as_str) {
+        Some("available") => {
+            aggregate.metrics_available = aggregate.metrics_available.saturating_add(1)
+        }
+        Some("malformed") => {
+            aggregate.metrics_malformed = aggregate.metrics_malformed.saturating_add(1)
+        }
+        _ => aggregate.metrics_unavailable = aggregate.metrics_unavailable.saturating_add(1),
+    }
+    add_measured(
+        &mut aggregate.requests_total,
+        &mut aggregate.requests_total_runs,
+        metrics.get("requests_total").and_then(Value::as_u64),
+    );
+    add_measured(
+        &mut aggregate.tokens_saved_total,
+        &mut aggregate.tokens_saved_total_runs,
+        metrics.get("tokens_saved_total").and_then(Value::as_u64),
+    );
+    add_measured(
+        &mut aggregate.bytes_compressed,
+        &mut aggregate.bytes_compressed_runs,
+        metrics.get("bytes_compressed").and_then(Value::as_u64),
+    );
+    add_measured(
+        &mut aggregate.tokens_processed,
+        &mut aggregate.tokens_processed_runs,
+        metrics.get("tokens_processed").and_then(Value::as_u64),
+    );
+}
+
+fn rolling_chain(window: RunWindow, keys: &[String]) -> String {
+    let mut chain = digest_text(&format!(
+        "leanctx-runs-v{CACHE_SCHEMA}|{}|{}",
+        window.days, window.cutoff_day
+    ));
+    for key in keys {
+        chain = digest_bytes(format!("{chain}{key}").as_bytes());
+    }
+    chain
+}
+
+fn list_runs(window: RunWindow) -> Result<Value, DataError> {
+    let _guard = LIST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| DataError::Unavailable)?;
     let root = configured_root()?;
     let broker = load_broker(&root)?;
     let mut assignments: Vec<(&String, &Assignment)> = broker.assignments.iter().collect();
     assignments.sort_by(|left, right| left.0.cmp(right.0));
-
-    let mut aggregate = Aggregate::new();
     let mut runs = Vec::with_capacity(assignments.len());
+    let mut run_keys = Vec::with_capacity(assignments.len());
+    let mut aggregate = Aggregate::new();
     for (key, assignment) in assignments {
         if key != &assignment.namespace {
             return Err(DataError::Malformed);
         }
-        let run = project_run(&root, &broker, assignment)?;
-        Aggregate::add(&run, &mut aggregate);
-        runs.push(run);
+        if !included_in_window(assignment, window) {
+            continue;
+        }
+        let fingerprint = assignment_fingerprint(&root, &broker, assignment);
+        let key = cache_file_key(&fingerprint);
+        let projection = bounded_cache_read(&cache_dir(&root).join(format!("run-{key}.json")))
+            .and_then(|bytes| serde_json::from_slice::<RunCacheFile>(&bytes).ok())
+            .filter(|file| {
+                file.schema == CACHE_SCHEMA
+                    && file.key == key
+                    && file.fingerprint == fingerprint
+                    && serde_json::to_vec(&file.projection)
+                        .ok()
+                        .map(|bytes| digest_bytes(&bytes))
+                        .as_deref()
+                        == Some(file.projection_sha256.as_str())
+            })
+            .map(|file| file.projection);
+        let projection = match projection {
+            Some(projection) => projection,
+            None => serde_json::to_value(project_run(&root, &broker, assignment)?)
+                .map_err(|_| DataError::Malformed)?,
+        };
+        let (key, projection, _) = cache_projection(&root, &fingerprint, Some(projection));
+        aggregate_from_projection(&projection, &mut aggregate);
+        run_keys.push(key);
+        runs.push(projection);
     }
-    Ok(json!({ "enabled": true, "status": "available", "aggregate": aggregate, "runs": runs }))
+    let chain = rolling_chain(window, &run_keys);
+    let cache_path = cache_dir(&root).join(format!("aggregate-{chain}.json"));
+    let cached_response = if let Some(bytes) = bounded_cache_read(&cache_path) {
+        serde_json::from_slice::<AggregateCacheFile>(&bytes)
+            .ok()
+            .filter(|file| {
+                file.schema == CACHE_SCHEMA
+                    && file.chain == chain
+                    && file.days == window.days
+                    && file.cutoff_day == window.cutoff_day
+                    && file.run_keys == run_keys
+                    && file.response_sha256
+                        == digest_text(&serde_json::to_string(&file.response).unwrap_or_default())
+            })
+            .map(|file| file.response)
+    } else {
+        None
+    };
+    let cache_state = if cached_response.is_some() {
+        "hit"
+    } else {
+        "miss"
+    };
+    let mut response = cached_response.unwrap_or_else(
+        || json!({ "enabled": true, "status": "available", "aggregate": aggregate, "runs": runs }),
+    );
+    if let Some(object) = response.as_object_mut() {
+        object.insert("cache".to_string(), json!({"state":cache_state, "schema":CACHE_SCHEMA, "key":chain, "days":window.days, "cutoff_day":window.cutoff_day}));
+    }
+    if cache_state == "miss" {
+        let persisted_response = json!({ "enabled": true, "status": "available", "aggregate": response.get("aggregate").cloned().unwrap_or_default(), "runs": response.get("runs").cloned().unwrap_or_default() });
+        let file = AggregateCacheFile {
+            schema: CACHE_SCHEMA,
+            chain: chain.clone(),
+            days: window.days,
+            cutoff_day: window.cutoff_day,
+            run_keys: run_keys.clone(),
+            response: persisted_response.clone(),
+            response_sha256: digest_text(
+                &serde_json::to_string(&persisted_response).unwrap_or_default(),
+            ),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&file) {
+            let _ = std::fs::create_dir_all(cache_dir(&root));
+            let _ = atomic_write(&cache_path, &bytes);
+            prune_cache(&cache_dir(&root), "aggregate-", MAX_AGGREGATE_CACHE_FILES);
+        }
+    }
+    Ok(response)
 }
 
 fn run_detail(namespace: &str) -> Result<Value, DataError> {
@@ -316,8 +672,32 @@ fn run_detail(namespace: &str) -> Result<Value, DataError> {
     if assignment.namespace != namespace {
         return Err(DataError::Malformed);
     }
-    let run = project_run(&root, &broker, assignment)?;
-    serde_json::to_value(run).map_err(|_| DataError::Malformed)
+    let fingerprint = assignment_fingerprint(&root, &broker, assignment);
+    let key = cache_file_key(&fingerprint);
+    let cached = bounded_cache_read(&cache_dir(&root).join(format!("run-{key}.json")))
+        .and_then(|bytes| serde_json::from_slice::<RunCacheFile>(&bytes).ok())
+        .filter(|file| {
+            file.schema == CACHE_SCHEMA
+                && file.key == key
+                && file.fingerprint == fingerprint
+                && serde_json::to_vec(&file.projection)
+                    .ok()
+                    .map(|bytes| digest_bytes(&bytes))
+                    .as_deref()
+                    == Some(file.projection_sha256.as_str())
+        })
+        .map(|file| file.projection);
+    if let Some(cached) = cached {
+        return Ok(cached);
+    }
+    let (_, projection, _) = cache_projection(
+        &root,
+        &fingerprint,
+        serde_json::to_value(project_run(&root, &broker, assignment)?)
+            .map_err(|_| DataError::Malformed)
+            .ok(),
+    );
+    Ok(projection)
 }
 
 fn project_run<'a>(
@@ -968,7 +1348,7 @@ mod tests {
     fn api_reports_disabled_unavailable_malformed_and_not_found_distinctly() {
         let _env_lock = crate::core::data_dir::test_env_lock();
         crate::test_env::remove_var(ROOT_ENV);
-        let (status, _, body) = handle("/api/runs").expect("route");
+        let (status, _, body) = handle("/api/runs", "").expect("route");
         assert_eq!(status, "503 Service Unavailable");
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["status"],
@@ -977,7 +1357,7 @@ mod tests {
 
         let td = tempfile::tempdir().expect("tempdir");
         crate::test_env::set_var(ROOT_ENV, td.path());
-        let (status, _, body) = handle("/api/runs").expect("route");
+        let (status, _, body) = handle("/api/runs", "").expect("route");
         assert_eq!(status, "503 Service Unavailable");
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["status"],
@@ -985,7 +1365,7 @@ mod tests {
         );
 
         std::fs::write(td.path().join("broker.json"), "not-json").expect("broker");
-        let (status, _, body) = handle("/api/runs").expect("route");
+        let (status, _, body) = handle("/api/runs", "").expect("route");
         assert_eq!(status, "500 Internal Server Error");
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["status"],
@@ -993,7 +1373,7 @@ mod tests {
         );
 
         write_broker(td.path(), json!({}));
-        let (status, _, body) = handle(&format!("/api/runs/{NS}")).expect("route");
+        let (status, _, body) = handle(&format!("/api/runs/{NS}"), "").expect("route");
         assert_eq!(status, "404 Not Found");
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["status"],
@@ -1034,7 +1414,7 @@ mod tests {
         );
         crate::test_env::set_var(ROOT_ENV, td.path());
         for path in [format!("/api/runs/{NS}"), format!("/api/runs/{NS}/")] {
-            let (status, _, body) = handle(&path).expect("route");
+            let (status, _, body) = handle(&path, "").expect("route");
             assert_eq!(status, "200 OK");
             let payload: Value = serde_json::from_str(&body).expect("json");
             assert_eq!(payload["metrics"]["requests_total"], 3);
@@ -1045,7 +1425,7 @@ mod tests {
             assert!(!body.contains("prompt"));
             assert!(!body.contains("token\""));
         }
-        let (status, _, _) = handle("/api/runs/INVALID").expect("route");
+        let (status, _, _) = handle("/api/runs/INVALID", "").expect("route");
         assert_eq!(status, "400 Bad Request");
         crate::test_env::remove_var(ROOT_ENV);
     }
