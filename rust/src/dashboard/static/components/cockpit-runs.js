@@ -1,55 +1,104 @@
-/** Broker-run overview and focused run view. */
-
+/** LeanCtx execution ledger: projects -> runs -> roles -> instances. */
 const RUN_NAMESPACE = /^[0-9a-f]{64}$/i;
 const METRIC_KEYS = [
-  ['requests_total', 'Requests'],
-  ['tokens_saved_total', 'Tokens saved'],
-  ['bytes_compressed', 'Bytes compressed'],
-  ['tokens_processed', 'Tokens processed'],
+  ["requests_total", "Requests"],
+  ["tokens_saved_total", "Tokens saved"],
+  ["bytes_compressed", "Bytes compressed"],
+  ["tokens_processed", "Tokens processed"],
 ];
-
 function runsApi() {
   return window.LctxApi && window.LctxApi.apiFetch;
 }
-
-function escapeHtml(value) {
-  const formatter = window.LctxFmt || {};
-  if (formatter.esc) return formatter.esc(String(value == null ? '' : value));
-  return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) =>
-    '&#' + ch.charCodeAt(0) + ';',
+function escapeHtml(v) {
+  const f = window.LctxFmt || {};
+  if (f.esc) return f.esc(String(v == null ? "" : v));
+  return String(v == null ? "" : v).replace(
+    /[&<>"']/g,
+    (c) => "&#" + c.charCodeAt(0) + ";",
   );
 }
-
-function isAvailable(value) {
-  return value !== undefined && value !== null && value !== '' &&
-    !(value && typeof value === 'object' && value.available === false);
+function isAvailable(v) {
+  return (
+    v !== undefined &&
+    v !== null &&
+    v !== "" &&
+    !(v && typeof v === "object" && v.available === false)
+  );
 }
-
-function displayValue(value) {
-  if (!isAvailable(value)) return 'Unavailable';
-  if (value && typeof value === 'object' && value.value !== undefined) {
-    return displayValue(value.value);
-  }
-  return escapeHtml(value);
+function displayValue(v) {
+  if (!isAvailable(v)) return "Unavailable";
+  if (v && typeof v === "object" && v.value !== undefined)
+    return displayValue(v.value);
+  return escapeHtml(v);
 }
-
-function metric(metrics, key) {
-  return metrics && Object.prototype.hasOwnProperty.call(metrics, key)
-    ? metrics[key]
-    : undefined;
+function metric(m, k) {
+  return m && Object.prototype.hasOwnProperty.call(m, k) ? m[k] : undefined;
 }
-
 function normalizedBasePath() {
-  const path = window.location.pathname.replace(/\/+$/, '') || '/';
-  const selected = path.match(/^(.*)\/runs\/[0-9a-f]{64}$/i);
-  if (selected) return selected[1] || '';
-  if (path === '/') return '';
-  return path;
+  const p = window.location.pathname.replace(/\/+$/, "") || "/";
+  const m = p.match(/^(.*)\/runs\/[0-9a-f]{64}$/i);
+  if (m) return m[1] || "";
+  return p === "/" ? "" : p;
 }
-
-function routePath(namespace) {
-  const base = normalizedBasePath();
-  return base + (base ? '/' : '/') + (namespace ? 'runs/' + namespace : '');
+function routePath(ns) {
+  const b = normalizedBasePath();
+  return b + (b ? "/" : "/") + (ns ? "runs/" + ns : "");
+}
+function scopeUrl(namespace, scope, search) {
+  const params = new URLSearchParams(search || window.location.search || "");
+  ["project", "task", "role", "order"].forEach((key) => params.delete(key));
+  if (scope && scope.project) params.set("project", scope.project);
+  if (scope && scope.task) params.set("task", scope.task);
+  if (scope && scope.role) params.set("role", scope.role);
+  if (scope && scope.mode === "timeline") params.set("order", "timeline");
+  const query = params.toString();
+  return routePath(namespace) + (query ? "?" + query : "");
+}
+function hierarchy(r) {
+  return r && r.hierarchy && typeof r.hierarchy === "object" ? r.hierarchy : {};
+}
+function humanize(v, f) {
+  const t = String(v || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .trim();
+  return t || f || "Unclassified";
+}
+function roleName(r) {
+  return hierarchy(r).role_label || r.member_id || "Unassigned";
+}
+function projectId(r) {
+  return hierarchy(r).project_id || "";
+}
+function projectLabel(r) {
+  if (!projectId(r)) return "Unclassified";
+  return (
+    hierarchy(r).project_label ||
+    hierarchy(r).workflow_label ||
+    (projectId(r) ? humanize(projectId(r)) : "Unclassified")
+  );
+}
+function timeOf(r) {
+  return hierarchy(r).timeline_time || r.created_at || r.last_seen_at || "";
+}
+function runCreated(r) {
+  return hierarchy(r).run_created_at || r.created_at || r.last_seen_at || "";
+}
+function runStatus(r) {
+  return hierarchy(r).run_status || r.status || "Unavailable";
+}
+function localTime(v, date) {
+  if (!v) return "Time unavailable";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v);
+  return d.toLocaleString(
+    undefined,
+    date ? { dateStyle: "medium", timeStyle: "short" } : { timeStyle: "short" },
+  );
+}
+function shortId(v) {
+  const t = String(v || "");
+  return t.length > 14 ? t.slice(0, 7) + "…" + t.slice(-5) : t;
 }
 
 class CockpitRuns extends HTMLElement {
@@ -59,12 +108,16 @@ class CockpitRuns extends HTMLElement {
     this._aggregate = null;
     this._detail = null;
     this._selected = null;
+    this._selectedRun = null;
+    this._selectedRole = null;
+    this._selectedInstance = null;
+    this._expandedRoles = new Set();
+    this._project = "";
+    this._mode = "role";
     this._enabled = null;
     this._loading = true;
     this._error = null;
     this._detailError = null;
-    this._openNew = false;
-    this._sort = 'recent';
     this._range = 30;
     this._generation = 0;
     this._inflight = false;
@@ -72,70 +125,85 @@ class CockpitRuns extends HTMLElement {
     this._reloadQuiet = true;
     this._retryAttempt = 0;
     this._retryTimer = null;
+    this._runLimit = 25;
     this._onPopState = this._onPopState.bind(this);
     this._onRangeChange = this._onRangeChange.bind(this);
   }
-
   connectedCallback() {
     if (this._ready) return;
     this._ready = true;
-    this.style.display = 'block';
-    if (new URLSearchParams(window.location.search).get('embed') === '1') {
-      document.documentElement.classList.add('lctx-embed' );
-      document.body.classList.add('lctx-embed' );
-    }
-    window.addEventListener('popstate', this._onPopState);
-    document.addEventListener('lctx:runs-range', this._onRangeChange);
+    this.style.display = "block";
+    this._overview =
+      this.querySelector("cockpit-overview") ||
+      document.getElementById("overviewView");
+    this._toolbarHost = document.createElement("div");
+    this._toolbarHost.className = "runs-toolbar-host";
+    this._overviewHost = this._overview;
+    this._overviewHost.classList.add("runs-overview-slot");
+    this._listHost = document.createElement("div");
+    this._listHost.className = "runs-list-host";
+    this.insertBefore(this._toolbarHost, this._overview);
+    this.appendChild(this._listHost);
+    window.addEventListener("popstate", this._onPopState);
+    document.addEventListener("lctx:runs-range", this._onRangeChange);
     this._syncPath();
     this.loadData();
     this._timer = setInterval(() => this.loadData(true), 15000);
   }
-
   disconnectedCallback() {
-    window.removeEventListener('popstate', this._onPopState);
-    document.removeEventListener('lctx:runs-range', this._onRangeChange);
+    window.removeEventListener("popstate", this._onPopState);
+    document.removeEventListener("lctx:runs-range", this._onRangeChange);
     if (this._timer) clearInterval(this._timer);
     if (this._retryTimer) clearTimeout(this._retryTimer);
   }
-
   _onPopState() {
     this._syncPath();
     this._generation++;
     this.loadData();
   }
-
-  _onRangeChange(event) {
-    const days = Number(event && event.detail && event.detail.days);
-    if (![0, 7, 30, 90].includes(days) || days === this._range) return;
-    this._range = days;
+  _onRangeChange(e) {
+    const d = Number(e && e.detail && e.detail.days);
+    if (![0, 7, 30, 90].includes(d) || d === this._range) return;
+    this._range = d;
+    this._runLimit = 25;
     this._generation++;
     this._retryAttempt = 0;
-    if (this._retryTimer) clearTimeout(this._retryTimer);
-    this.loadData();
-  }
-
-  _syncPath() {
-    const path = window.location.pathname.replace(/\/+$/, '');
-    const match = path.match(/\/runs\/([0-9a-f]{64})$/i);
-    this._selected = match ? match[1].toLowerCase() : null;
-  }
-
-  _navigate(namespace) {
-    const selected = String(namespace || '').toLowerCase();
-    if (selected && !RUN_NAMESPACE.test(selected)) return;
-    const url = routePath(selected);
-    const query = window.location.search;
-    const hash = window.location.hash;
-    if (this._openNew && selected) {
-      window.open(url + query + hash, '_blank', 'noopener,noreferrer');
-      return;
+    if (this._retryTimer) {
+      clearTimeout(this._retryTimer);
+      this._retryTimer = null;
     }
-    history.pushState({ run: selected || null }, '', url + query + hash);
-    this._syncPath();
-    this._generation++;
     this.loadData();
   }
-
+  _syncPath() {
+    const m = window.location.pathname
+      .replace(/\/+$/, "")
+      .match(/\/runs\/([0-9a-f]{64})$/i);
+    this._selected = m ? m[1].toLowerCase() : null;
+    const params = new URLSearchParams(window.location.search || "");
+    this._project = params.get("project") || "";
+    this._selectedRun = params.get("task") || null;
+    this._selectedRole = params.get("role") || null;
+    this._mode = params.get("order") === "timeline" ? "timeline" : "role";
+  }
+  _navigate(ns, reload = true) {
+    const s = String(ns || "").toLowerCase();
+    if (s && !RUN_NAMESPACE.test(s)) return;
+    history.pushState(
+      { run: s || null },
+      "",
+      scopeUrl(s, {
+        project: this._project,
+        task: this._selectedRun,
+        role: this._selectedRole,
+        mode: this._mode,
+      }) + window.location.hash,
+    );
+    this._syncPath();
+    if (reload) {
+      this._generation++;
+      this.loadData();
+    } else this.render();
+  }
   async loadData(quiet) {
     const fetchJson = runsApi();
     if (!fetchJson) return;
@@ -145,252 +213,758 @@ class CockpitRuns extends HTMLElement {
       return;
     }
     this._inflight = true;
-    const generation = ++this._generation;
+    const g = ++this._generation;
     if (!quiet) {
       this._loading = true;
       this._error = null;
       this._detailError = null;
       this.render();
     }
-    this._detail = null;
-    this._detailError = null;
     try {
-      const index = await fetchJson(this._apiPath(''), { timeoutMs: 15000 });
-      if (generation !== this._generation) { this._finishLoad(); return; }
-      if (!index || typeof index !== 'object' || typeof index.enabled !== 'boolean') {
-        this._enabled = null;
-        this._runs = [];
-        this._aggregate = null;
-        this._error = 'Run history response is unavailable or malformed';
-        this._loading = false;
-        this._scheduleRetry();
-        this.render();
-        this._finishLoad();
-        return;
-      }
+      const index = await fetchJson(this._apiPath(""), { timeoutMs: 15000 });
+      if (g !== this._generation) return this._finishLoad();
+      if (
+        !index ||
+        typeof index !== "object" ||
+        typeof index.enabled !== "boolean"
+      )
+        throw new Error("Run history response is unavailable or malformed");
       this._enabled = index.enabled;
       this._runs = Array.isArray(index.runs) ? index.runs : [];
-      this._aggregate = index.aggregate && typeof index.aggregate === 'object'
-        ? index.aggregate : null;
-      if (index.enabled === false) {
-        this._selected = null;
-        this._loading = false;
-        this.render();
-        this._finishLoad();
-        return;
-      }
+      this._aggregate = index.aggregate || null;
       if (this._selected) {
         try {
           const detail = await fetchJson(this._apiPath(this._selected));
-          if (generation !== this._generation) { this._finishLoad(); return; }
-          this._detail = detail && typeof detail === 'object' ? detail : null;
-        } catch (error) {
-          if (generation !== this._generation) { this._finishLoad(); return; }
-          this._detailError = error && error.error
-            ? String(error.error) : 'Unable to load the selected run';
+          if (g !== this._generation) return this._finishLoad();
+          this._detail = detail && typeof detail === "object" ? detail : null;
+        } catch (e) {
+          if (g !== this._generation) return this._finishLoad();
+          this._detailError =
+            e && e.error ? String(e.error) : "Unable to load the selected run";
         }
       }
-      if (generation !== this._generation) { this._finishLoad(); return; }
+      this._resolveSelection();
       this._loading = false;
       this._error = null;
       this._retryAttempt = 0;
-      if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
-    } catch (error) {
-      if (generation !== this._generation) { this._finishLoad(); return; }
-      this._loading = false;
-      this._error = error && error.error
-        ? String(error.error) : 'Run history is unavailable';
-      this._scheduleRetry();
+      if (this._retryTimer) {
+        clearTimeout(this._retryTimer);
+        this._retryTimer = null;
+      }
+    } catch (e) {
+      if (g === this._generation) {
+        this._loading = false;
+        this._error =
+          e && e.error
+            ? String(e.error)
+            : String(e.message || "Run history is unavailable");
+        this._scheduleRetry();
+      }
     }
     this._finishLoad();
     this.render();
   }
-
   _finishLoad() {
     this._inflight = false;
     if (!this._reloadPending) return;
-    const quiet = this._reloadQuiet;
+    const q = this._reloadQuiet;
     this._reloadPending = false;
     this._reloadQuiet = true;
-    Promise.resolve().then(() => this.loadData(quiet));
+    Promise.resolve().then(() => this.loadData(q));
   }
-
   _scheduleRetry() {
     if (this._retryTimer) return;
-    const delays = [2000, 5000, 10000, 15000];
-    const delay = delays[Math.min(this._retryAttempt++, delays.length - 1)];
-    this._retryTimer = setTimeout(() => {
-      this._retryTimer = null;
-      this.loadData(true);
-    }, delay);
+    const ds = [2000, 5000, 10000, 15000];
+    this._retryTimer = setTimeout(
+      () => {
+        this._retryTimer = null;
+        this.loadData(true);
+      },
+      ds[Math.min(this._retryAttempt++, ds.length - 1)],
+    );
   }
-
   _retryNow() {
     this._retryAttempt = 0;
-    if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+    if (this._retryTimer) {
+      clearTimeout(this._retryTimer);
+      this._retryTimer = null;
+    }
     this.loadData();
   }
-
-  _apiPath(namespace) {
-    const base = normalizedBasePath();
-    return base + '/api/runs' + (namespace ? '/' + encodeURIComponent(namespace) : '') +
-      '?days=' + encodeURIComponent(String(this._range));
+  _apiPath(ns) {
+    const b = normalizedBasePath();
+    return (
+      b +
+      "/api/runs" +
+      (ns ? "/" + encodeURIComponent(ns) : "") +
+      "?days=" +
+      encodeURIComponent(String(this._range))
+    );
   }
-
-  _ordered() {
-    return this._runs.slice().sort((a, b) => {
-      if (this._sort === 'saved') {
-        return Number(metric(b.metrics, 'tokens_saved_total') || -1) -
-          Number(metric(a.metrics, 'tokens_saved_total') || -1);
-      }
-      const ad = Date.parse(a.last_seen_at || a.created_at || '') || 0;
-      const bd = Date.parse(b.last_seen_at || b.created_at || '') || 0;
-      return bd - ad;
+  _resolveSelection() {
+    const freshInstance = this._runs.find(
+      (r) => String(r.namespace || "").toLowerCase() === this._selected,
+    );
+    if (this._selected && !freshInstance) this._selected = null;
+    this._selectedInstance = freshInstance || null;
+    if (freshInstance) {
+      this._selectedRun = freshInstance.task_id || "";
+      this._project = projectId(freshInstance) || "__unclassified";
+      this._selectedRole = roleName(freshInstance);
+      this._expandedRoles.add(this._selectedRole);
+    }
+    const projectExists =
+      !this._project || this._projects().some((p) => p.id === this._project);
+    if (!projectExists) {
+      this._project = "";
+      this._selectedRun = null;
+      this._selectedRole = null;
+      this._selectedInstance = null;
+      this._selected = null;
+      return;
+    }
+    const runExists =
+      !this._selectedRun ||
+      this._logicalRuns().some((run) => run.id === this._selectedRun);
+    if (!runExists) {
+      this._selectedRun = null;
+      this._selectedRole = null;
+      this._selectedInstance = null;
+      this._selected = null;
+      return;
+    }
+    const selectedRows = this._selectedRows();
+    if (
+      this._selectedRole &&
+      selectedRows &&
+      !selectedRows.rows.some((run) => roleName(run) === this._selectedRole)
+    ) {
+      this._selectedRole = null;
+      this._selectedInstance = null;
+      this._selected = null;
+    }
+  }
+  _projects() {
+    const m = new Map();
+    this._runs.forEach((r) => {
+      const id = projectId(r) || "__unclassified";
+      if (!m.has(id))
+        m.set(id, {
+          id,
+          label: id === "__unclassified" ? "Unclassified" : projectLabel(r),
+          runs: [],
+        });
+      m.get(id).runs.push(r);
     });
+    const out = [...m.values()].sort((a, b) => a.label.localeCompare(b.label));
+    const counts = new Map();
+    out.forEach((p) => counts.set(p.label, (counts.get(p.label) || 0) + 1));
+    out.forEach((p) => {
+      if (counts.get(p.label) > 1) p.label += " · " + shortId(p.id);
+      p.logicalCount = new Set(
+        p.runs.map((run) => run.task_id || run.namespace),
+      ).size;
+    });
+    return out;
   }
-
-  _label(run) {
-    return (run.task_id || 'task unavailable') + ' - ' +
-      (run.assignment_id || 'assignment unavailable') + ' - ' +
-      (run.member_id || 'member unavailable');
+  _scopedRuns() {
+    return this._project
+      ? this._runs.filter((r) =>
+          this._project === "__unclassified"
+            ? projectId(r) === ""
+            : projectId(r) === this._project,
+        )
+      : this._runs;
   }
-
+  _logicalRuns() {
+    const m = new Map();
+    this._scopedRuns().forEach((r) => {
+      const id = r.task_id || String(r.namespace || "");
+      if (!m.has(id)) m.set(id, []);
+      m.get(id).push(r);
+    });
+    return [...m.entries()]
+      .map(([id, rows]) => ({
+        id,
+        rows,
+        first: rows
+          .slice()
+          .sort(
+            (a, b) =>
+              (Date.parse(timeOf(a)) || 0) - (Date.parse(timeOf(b)) || 0),
+          )[0],
+      }))
+      .sort(
+        (a, b) =>
+          (Date.parse(timeOf(b.first)) || 0) -
+          (Date.parse(timeOf(a.first)) || 0),
+      );
+  }
+  _selectedRows() {
+    return this._logicalRuns().find((r) => r.id === this._selectedRun) || null;
+  }
+  _metrics(rows) {
+    const t = {};
+    (rows || []).forEach((r) =>
+      METRIC_KEYS.forEach(([k]) => {
+        const v = metric(r.metrics, k);
+        if (isAvailable(v)) t[k] = (Number(t[k]) || 0) + (Number(v) || 0);
+      }),
+    );
+    return t;
+  }
+  _scopeOverview(label, rows) {
+    if (this._overview && typeof this._overview.setRunScope === "function")
+      this._overview.setRunScope({
+        label,
+        interval:
+          this._range === 0 ? "All time" : "Last " + this._range + " days",
+        rows: rows || [],
+        metrics: this._metrics(rows || []),
+      });
+  }
+  _friendlyScopeLabel(rows, suffix) {
+    const first = rows && rows[0];
+    const project = first
+      ? projectLabel(first)
+      : this._project === "__unclassified"
+        ? "Unclassified"
+        : "All projects";
+    const run = first
+      ? humanize(
+          hierarchy(first).run_label || hierarchy(first).workflow_label,
+          "Run " + shortId(first.task_id),
+        )
+      : "All runs";
+    return [project, this._selectedRun ? run : null, suffix || null]
+      .filter(Boolean)
+      .join(" › ");
+  }
   _selector() {
-    let html = '<div class="runs-toolbar"><label for="runsSelector">Run</label>' +
-      '<select id="runsSelector" aria-label="Select a LeanCtx run">' +
-      '<option value=""' + (!this._selected ? ' selected' : '') + '>All runs</option>';
-    this._runs.forEach((run) => {
-      const namespace = run && typeof run.namespace === 'string'
-        ? run.namespace.toLowerCase() : '';
-      if (RUN_NAMESPACE.test(namespace)) {
-        html += '<option value="' + escapeHtml(namespace) + '"' +
-          (namespace === this._selected ? ' selected' : '') + '>' +
-          escapeHtml(this._label(run)) + '</option>';
-      }
+    let h =
+      '<div class="runs-toolbar"><label for="runsSelector">Project</label><select id="runsSelector" aria-label="Select a LeanCtx project"><option value=""' +
+      (!this._project ? " selected" : "") +
+      ">All projects</option>";
+    this._projects().forEach((p) => {
+      h +=
+        '<option value="' +
+        escapeHtml(p.id) +
+        '"' +
+        (p.id === this._project ? " selected" : "") +
+        ">" +
+        escapeHtml(p.label) +
+        " · " +
+        p.logicalCount +
+        " runs · " +
+        p.runs.length +
+        " assignments" +
+        "</option>";
     });
-    html += '</select><label for="runsSort">Sort</label>' +
-      '<select id="runsSort" aria-label="Sort LeanCtx runs">' +
-      '<option value="recent"' + (this._sort === 'recent' ? ' selected' : '') +
-      '>Most recent</option><option value="saved"' +
-      (this._sort === 'saved' ? ' selected' : '') + '>Tokens saved</option>' +
-      '</select><label class="runs-new-tab"><input type="checkbox" id="runsNewTab"' +
-      (this._openNew ? ' checked' : '') +
-      '> Open selected run in new tab</label></div>';
-    return html;
+    return (
+      h +
+      '</select><div class="runs-range-controls" role="group" aria-label="Run interval">' +
+      [7, 30, 90, 0]
+        .map(
+          (days) =>
+            '<button type="button" data-range="' +
+            days +
+            '" aria-pressed="' +
+            (this._range === days) +
+            '" class="' +
+            (this._range === days ? "is-active" : "") +
+            '">' +
+            (days === 0 ? "All" : days + "d") +
+            "</button>",
+        )
+        .join("") +
+      '</div><span class="runs-range-note">' +
+      escapeHtml(
+        this._range === 0 ? "All time" : "Last " + this._range + " days",
+      ) +
+      "</span></div>"
+    );
   }
-
-  _stateCard(title, text, className) {
-    return '<div class="card runs-state ' + (className || '') + '" role="status">' +
-      '<p class="eyebrow">' + escapeHtml(title) + '</p><p class="hs">' +
-      escapeHtml(text) + '</p></div>';
+  _stateCard(t, x, c) {
+    return (
+      '<div class="card runs-state ' +
+      (c || "") +
+      '" role="status"><p class="eyebrow">' +
+      escapeHtml(t) +
+      '</p><p class="hs">' +
+      escapeHtml(x) +
+      "</p></div>"
+    );
   }
-
-  _aggregateView() {
-    const aggregate = this._aggregate || {};
-    const runCount = metric(aggregate, 'total_runs');
-    const rangeLabel = this._range === 0 ? 'All time' : this._range + ' days';
-    let html = '<div class="runs-overview-head"><div><p class="eyebrow">BROKER RUNS</p>' +
-      '<h2>' + escapeHtml(rangeLabel) + '</h2><p class="hs">Historical and active LeanCtx assignment runs.</p>' +
-      '</div><div class="runs-totals"><div><strong>' +
-      displayValue(runCount) + '</strong><span>Runs</span></div><div><strong>' +
-      displayValue(metric(aggregate, 'tokens_saved_total')) +
-      '</strong><span>Tokens saved</span></div></div></div>';
-    if (!this._runs.length) {
-      return html + this._stateCard('NO RUNS', 'No broker runs are available yet.', 'runs-empty');
-    }
-    return html + '<div class="runs-list" role="list">' +
-      this._ordered().map((run) => this._row(run)).join('') + '</div>';
+  _crumbs() {
+    const p = [{ label: "All projects", key: "projects" }];
+    if (this._project)
+      p.push({
+        label:
+          this._project === "__unclassified"
+            ? "Unclassified"
+            : projectLabel(this._scopedRuns()[0]),
+        key: "project",
+      });
+    if (this._selectedRun)
+      p.push({ label: "Run " + shortId(this._selectedRun), key: "run" });
+    if (this._selectedRole)
+      p.push({ label: humanize(this._selectedRole), key: "role" });
+    if (this._selectedInstance)
+      p.push({
+        label: humanize(this._selectedRole) + " instance",
+        key: "instance",
+      });
+    return (
+      '<nav class="runs-breadcrumb" aria-label="Run path">' +
+      p
+        .map(
+          (x, i) =>
+            (i ? ' <span aria-hidden="true">›</span> ' : "") +
+            '<button type="button" data-crumb="' +
+            x.key +
+            '">' +
+            escapeHtml(x.label) +
+            "</button>",
+        )
+        .join("") +
+      "</nav>"
+    );
   }
-
-  _row(run) {
-    const namespace = run && typeof run.namespace === 'string'
-      ? run.namespace.toLowerCase() : '';
-    if (!RUN_NAMESPACE.test(namespace)) return '';
-    return '<button type="button" class="runs-row" role="listitem" data-run="' +
-      escapeHtml(namespace) + '"><span class="runs-row-main"><strong>' +
-      escapeHtml(this._label(run)) + '</strong><small>' +
-      escapeHtml(run.status || 'Unavailable') + ' - ' +
-      escapeHtml(metric(run.metrics, 'source') || 'Unavailable') +
-      '</small></span><span class="runs-row-metric">' +
-      displayValue(metric(run.metrics, 'tokens_saved_total')) +
-      '</span><span class="runs-row-arrow" aria-hidden="true">&rarr;</span></button>';
+  _projectView() {
+    const ps = this._projects();
+    this._scopeOverview(
+      this._project
+        ? this._scopedRuns()[0] && projectLabel(this._scopedRuns()[0])
+        : "All projects",
+      this._scopedRuns(),
+    );
+    if (!ps.length)
+      return this._stateCard(
+        "NO RUNS",
+        "No broker runs are available yet.",
+        "runs-empty",
+      );
+    if (!this._project)
+      return (
+        '<section class="runs-ledger"><div class="runs-section-head"><div><p class="eyebrow">PROJECTS</p><h2>Choose a project</h2></div><span class="runs-count">' +
+        ps.length +
+        '</span></div><div class="runs-list" role="list">' +
+        ps
+          .map(
+            (p) =>
+              '<button type="button" class="runs-row runs-project-row" data-project="' +
+              escapeHtml(p.id) +
+              '" role="listitem"><span class="runs-row-main"><strong>' +
+              escapeHtml(p.label) +
+              "</strong><small>" +
+              p.logicalCount +
+              " runs · " +
+              p.runs.length +
+              ' assignments</small></span><span class="runs-row-arrow" aria-hidden="true">→</span></button>',
+          )
+          .join("") +
+        "</div></section>"
+      );
+    const ls = this._logicalRuns();
+    return (
+      '<section class="runs-ledger"><div class="runs-section-head"><div><p class="eyebrow">LOGICAL RUNS</p><h2>' +
+      escapeHtml(projectLabel(this._scopedRuns()[0])) +
+      '</h2></div><span class="runs-count">' +
+      ls.length +
+      '</span></div><div class="runs-list" role="list">' +
+      ls
+        .slice(0, this._runLimit)
+        .map((x) => this._runRow(x))
+        .join("") +
+      "</div>" +
+      (ls.length > this._runLimit
+        ? '<button type="button" class="btn runs-load-more" id="runsLoadMore">Load more runs</button>'
+        : "") +
+      "</section>"
+    );
   }
-
-  _detailView() {
-    if (this._detailError) {
-      return this._stateCard('RUN UNAVAILABLE', this._detailError, 'runs-unavailable') +
-        '<button type="button" class="runs-back" id="runsBack">&larr; All runs</button>';
-    }
-    const run = this._detail;
-    if (!run) return this._stateCard('RUN UNAVAILABLE',
-      'The selected run was not found.', 'runs-unavailable');
-    const metrics = run.metrics || {};
-    let html = '<div class="runs-detail-head"><div><p class="eyebrow">SELECTED RUN</p>' +
-      '<h2>' + escapeHtml(this._label(run)) + '</h2><p class="hs">Namespace <code>' +
-      escapeHtml(this._selected) + '</code></p></div><button type="button" class="runs-back" ' +
-      'id="runsBack">&larr; All runs</button></div><div class="runs-detail-grid">' +
-      this._card('Status', run.status) + this._card('Source', metrics.source);
-    METRIC_KEYS.forEach(([key, label]) => {
-      if (Object.prototype.hasOwnProperty.call(metrics, key)) {
-        html += this._card(label, metric(metrics, key));
-      }
+  _runRow(x) {
+    const f = x.first;
+    const label =
+      hierarchy(f).run_label || hierarchy(f).workflow_label || "Run";
+    return (
+      '<div class="runs-row runs-row-container"><button type="button" class="runs-row-main-button" data-run-id="' +
+      escapeHtml(x.id) +
+      '" role="listitem"><span class="runs-row-main"><strong>' +
+      escapeHtml(humanize(label, "Run")) +
+      " · " +
+      escapeHtml(localTime(runCreated(f), true)) +
+      "</strong><small>" +
+      escapeHtml(shortId(x.id)) +
+      " · " +
+      escapeHtml(runStatus(f)) +
+      " · " +
+      x.rows.length +
+      ' agents</small></span><span class="runs-row-metric">' +
+      displayValue(this._metrics(x.rows).tokens_saved_total) +
+      '</span><span class="runs-row-arrow" aria-hidden="true">→</span></button><a class="runs-open-link" href="' +
+      escapeHtml(
+        scopeUrl("", { project: this._project, task: x.id, mode: this._mode }),
+      ) +
+      '" target="_blank" rel="noopener" aria-label="Open run in new tab">↗</a></div>'
+    );
+  }
+  _roleGroups(rows) {
+    const m = new Map();
+    rows.forEach((r) => {
+      const k = roleName(r);
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(r);
     });
-    return html + '</div>';
+    m.forEach((group) => group.sort((a, b) => this._timelineCompare(a, b)));
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   }
-
-  _card(label, value) {
-    return '<div class="card runs-detail-card"><span class="eyebrow">' +
-      escapeHtml(label) + '</span><strong>' + displayValue(value) + '</strong></div>';
+  _timelineCompare(a, b) {
+    return (
+      (Number(hierarchy(a).timeline_rank) || Infinity) -
+        (Number(hierarchy(b).timeline_rank) || Infinity) ||
+      (Date.parse(timeOf(a)) || 0) - (Date.parse(timeOf(b)) || 0) ||
+      String(a.namespace || "").localeCompare(String(b.namespace || ""))
+    );
   }
-
+  _roleView() {
+    const s = this._selectedRows();
+    if (!s)
+      return this._stateCard(
+        "RUN NOT FOUND",
+        "Choose a run to inspect its execution ledger.",
+        "runs-empty",
+      );
+    const rows = s.rows;
+    const scopedRows = this._selectedInstance
+      ? [this._selectedInstance]
+      : this._selectedRole
+        ? rows.filter((r) => roleName(r) === this._selectedRole)
+        : rows;
+    this._scopeOverview(
+      this._friendlyScopeLabel(
+        scopedRows,
+        this._selectedInstance
+          ? humanize(this._selectedRole) + " instance"
+          : this._selectedRole
+            ? humanize(this._selectedRole)
+            : null,
+      ),
+      scopedRows,
+    );
+    let h =
+      '<section class="runs-ledger"><div class="runs-detail-head">' +
+      this._crumbs() +
+      '<div><p class="eyebrow">AGENT LEDGER</p><h2>Run details</h2></div><div class="runs-mode-toggle" role="group" aria-label="Run ordering"><button type="button" data-mode="role" aria-pressed="true" class="is-active">By role</button><button type="button" data-mode="timeline" aria-pressed="false">Timeline</button></div></div><div class="runs-role-list" role="list">';
+    this._roleGroups(rows).forEach(([role, rr]) => {
+      const open = this._expandedRoles.has(role);
+      h +=
+        '<div class="runs-role-group" role="listitem"><div class="runs-role-line"><button type="button" class="runs-disclosure" data-role-toggle="' +
+        escapeHtml(role) +
+        '" aria-expanded="' +
+        open +
+        '" aria-label="' +
+        (open ? "Collapse " : "Expand ") +
+        escapeHtml(role) +
+        '">' +
+        (open ? "⌄" : "›") +
+        '</button><button type="button" class="runs-role-select" data-role="' +
+        escapeHtml(role) +
+        '"><strong>' +
+        escapeHtml(humanize(role)) +
+        '</strong><span class="runs-count">' +
+        rr.length +
+        "</span><small>" +
+        escapeHtml(displayValue(this._metrics(rr).tokens_saved_total)) +
+        " tokens saved</small></button></div>" +
+        (open
+          ? '<div class="runs-instance-list">' +
+            rr.map((r, i) => this._instanceRow(r, i)).join("") +
+            "</div>"
+          : "") +
+        "</div>";
+    });
+    return h + "</div></section>";
+  }
+  _instanceRow(r, i) {
+    const ns = String(r.namespace || "").toLowerCase();
+    const sel = ns === this._selected;
+    const n = String(i + 1).padStart(2, "0");
+    return (
+      '<div class="runs-instance-line' +
+      (sel ? " is-selected" : "") +
+      '"><button type="button" class="runs-instance-select" data-instance="' +
+      escapeHtml(ns) +
+      '" title="' +
+      escapeHtml(ns) +
+      '"><strong>' +
+      escapeHtml(humanize(roleName(r))) +
+      " " +
+      n +
+      "</strong><small>" +
+      escapeHtml(localTime(timeOf(r))) +
+      " · " +
+      escapeHtml(r.status || "Unavailable") +
+      " · " +
+      escapeHtml(String(hierarchy(r).attempt_count || 1)) +
+      " attempt" +
+      (Number(hierarchy(r).attempt_count || 1) === 1 ? "" : "s") +
+      '</small></button><a class="runs-open-link" href="' +
+      escapeHtml(
+        scopeUrl(ns, {
+          project: this._project,
+          task: this._selectedRun,
+          role: this._selectedRole,
+          mode: this._mode,
+        }),
+      ) +
+      '" target="_blank" rel="noopener" aria-label="Open instance in new tab">↗</a></div>'
+    );
+  }
+  _timelineView() {
+    const s = this._selectedRows();
+    if (!s)
+      return this._stateCard(
+        "RUN NOT FOUND",
+        "Choose a run to inspect its execution ledger.",
+        "runs-empty",
+      );
+    const scopedRows = this._selectedInstance
+      ? [this._selectedInstance]
+      : s.rows;
+    this._scopeOverview(
+      this._friendlyScopeLabel(
+        scopedRows,
+        this._selectedInstance
+          ? humanize(this._selectedRole) + " instance"
+          : "Timeline",
+      ),
+      scopedRows,
+    );
+    const rows = s.rows.slice().sort((a, b) => this._timelineCompare(a, b));
+    let h =
+      '<section class="runs-ledger"><div class="runs-detail-head">' +
+      this._crumbs() +
+      '<div><p class="eyebrow">EXECUTION TIMELINE</p><h2>Dispatch order</h2><p class="hs">Linked dispatch first; creation time is the fallback.</p></div><div class="runs-mode-toggle" role="group" aria-label="Run ordering"><button type="button" data-mode="role" aria-pressed="false">By role</button><button type="button" data-mode="timeline" aria-pressed="true" class="is-active">Timeline</button></div></div><div class="runs-timeline" role="list">';
+    rows.forEach((r, i) => {
+      const basis =
+        hierarchy(r).timeline_source === "dispatch"
+          ? "dispatch order"
+          : "creation fallback";
+      h +=
+        '<div class="runs-timeline-line" role="listitem"><span class="runs-timeline-index">' +
+        String(i + 1).padStart(2, "0") +
+        '</span><button type="button" class="runs-instance-select" data-instance="' +
+        escapeHtml(String(r.namespace || "").toLowerCase()) +
+        '"><strong>' +
+        escapeHtml(humanize(roleName(r))) +
+        "</strong><small>" +
+        escapeHtml(localTime(timeOf(r))) +
+        " · " +
+        escapeHtml(r.status || "Unavailable") +
+        '</small></button><span class="runs-basis">' +
+        basis +
+        '</span><a class="runs-open-link" href="' +
+        escapeHtml(
+          scopeUrl(r.namespace, {
+            project: this._project,
+            task: this._selectedRun,
+            role: roleName(r),
+            mode: this._mode,
+          }),
+        ) +
+        '" target="_blank" rel="noopener" aria-label="Open instance in new tab">↗</a></div>';
+    });
+    return h + "</div></section>";
+  }
   render() {
+    if (this._toolbarHost && this._overviewHost && this._listHost) {
+      this._toolbarHost.innerHTML = "";
+      if (this._enabled === false) {
+        this._listHost.innerHTML = this._stateCard(
+          "UNAVAILABLE",
+          "Broker run history is disabled.",
+          "runs-disabled",
+        );
+        return;
+      }
+      if (this._loading && !this._runs.length) {
+        this._listHost.innerHTML = this._stateCard(
+          "LOADING",
+          "Loading run history…",
+        );
+        return;
+      }
+      if (this._error) {
+        this._listHost.innerHTML =
+          this._stateCard("UNAVAILABLE", this._error, "runs-unavailable") +
+          '<button type="button" class="runs-back" id="runsRetry">Retry now</button>';
+        const retry = this._listHost.querySelector("#runsRetry");
+        if (retry) retry.addEventListener("click", () => this._retryNow());
+        return;
+      }
+      this._toolbarHost.innerHTML = this._selector();
+      this._listHost.innerHTML = this._selectedRun
+        ? this._mode === "timeline"
+          ? this._timelineView()
+          : this._roleView()
+        : this._projectView();
+      this._bindHosts();
+      return;
+    }
     if (this._enabled === false) {
-      this.innerHTML = this._stateCard('UNAVAILABLE',
-        'Broker run history is disabled.', 'runs-disabled');
-      document.body.classList.remove('lctx-run-selected');
+      this.innerHTML = this._stateCard(
+        "UNAVAILABLE",
+        "Broker run history is disabled.",
+        "runs-disabled",
+      );
       return;
     }
     if (this._loading && !this._runs.length) {
-      this.innerHTML = this._stateCard('LOADING', 'Loading run history...');
+      this.innerHTML = this._stateCard("LOADING", "Loading run history…");
       return;
     }
     if (this._error) {
-      this.innerHTML = this._stateCard('UNAVAILABLE', this._error, 'runs-unavailable') +
+      this.innerHTML =
+        this._stateCard("UNAVAILABLE", this._error, "runs-unavailable") +
         '<button type="button" class="runs-back" id="runsRetry">Retry now</button>';
-      const retry = this.querySelector('#runsRetry');
-      if (retry) retry.addEventListener('click', () => this._retryNow());
+      const r = this.querySelector("#runsRetry");
+      if (r) r.addEventListener("click", () => this._retryNow());
       return;
     }
-    this.innerHTML = this._selector() +
-      (this._selected ? this._detailView() : this._aggregateView());
+    this.innerHTML =
+      this._selector() +
+      '<div class="runs-overview-slot" id="runsOverviewSlot"></div>' +
+      (this._selectedRun
+        ? this._mode === "timeline"
+          ? this._timelineView()
+          : this._roleView()
+        : this._projectView());
+    if (this._overview) {
+      const slot = this.querySelector("#runsOverviewSlot");
+      if (slot) slot.appendChild(this._overview);
+    }
     this._bind();
-    const overview = document.getElementById('overviewView');
-    if (overview) overview.hidden = !!this._selected;
-    document.body.classList.toggle('lctx-run-selected', !!this._selected);
+    document.body.classList.toggle("lctx-run-selected", !!this._selectedRun);
   }
 
-  _bind() {
-    const selector = this.querySelector('#runsSelector');
-    if (selector) selector.addEventListener('change', (event) => {
-      this._navigate(event.target.value);
-    });
-    const sort = this.querySelector('#runsSort');
-    if (sort) sort.addEventListener('change', (event) => {
-      this._sort = event.target.value;
-      this.render();
-    });
-    const checkbox = this.querySelector('#runsNewTab');
-    if (checkbox) checkbox.addEventListener('change', (event) => {
-      this._openNew = !!event.target.checked;
-    });
-    this.querySelectorAll('[data-run]').forEach((row) => {
-      row.addEventListener('click', () => this._navigate(row.dataset.run));
-    });
-    const back = this.querySelector('#runsBack');
-    if (back) back.addEventListener('click', () => this._navigate(''));
+  _bindHosts() {
+    this._bind(this._toolbarHost);
+    this._bind(this._listHost);
+  }
+  _bind(root = this) {
+    const s = root.querySelector("#runsSelector");
+    if (s)
+      s.addEventListener("change", (e) => {
+        this._project = e.target.value;
+        this._runLimit = 25;
+        this._selectedRun = null;
+        this._selectedRole = null;
+        this._selectedInstance = null;
+        this._selected = null;
+        this._navigate("", false);
+        this.render();
+      });
+    root.querySelectorAll("[data-range]").forEach((button) =>
+      button.addEventListener("click", () => {
+        document.dispatchEvent(
+          new CustomEvent("lctx:runs-range", {
+            detail: { days: Number(button.dataset.range) },
+          }),
+        );
+      }),
+    );
+    root.querySelectorAll("[data-project]").forEach((e) =>
+      e.addEventListener("click", () => {
+        this._project = e.dataset.project;
+        this._runLimit = 25;
+        this._navigate("", false);
+        this.render();
+      }),
+    );
+    root.querySelectorAll("[data-run-id]").forEach((e) =>
+      e.addEventListener("click", () => {
+        this._selectedRun = e.dataset.runId;
+        this._selectedRole = null;
+        this._selectedInstance = null;
+        this._mode = "role";
+        this._navigate("", false);
+        this.render();
+      }),
+    );
+    root.querySelectorAll("[data-role-toggle]").forEach((e) =>
+      e.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const r = e.dataset.roleToggle;
+        if (this._expandedRoles.has(r)) this._expandedRoles.delete(r);
+        else this._expandedRoles.add(r);
+        this.render();
+      }),
+    );
+    root.querySelectorAll("[data-role]").forEach((e) =>
+      e.addEventListener("click", () => {
+        this._selectedRole = e.dataset.role;
+        this._selectedInstance = null;
+        this._selected = null;
+        this._expandedRoles.add(e.dataset.role);
+        this._navigate("", false);
+        this.render();
+      }),
+    );
+    root.querySelectorAll("[data-instance]").forEach((e) =>
+      e.addEventListener("click", () => {
+        this._selected = e.dataset.instance;
+        this._selectedInstance =
+          this._runs.find(
+            (r) => String(r.namespace || "").toLowerCase() === this._selected,
+          ) || null;
+        this._selectedRole = this._selectedInstance
+          ? roleName(this._selectedInstance)
+          : this._selectedRole;
+        this._expandedRoles.add(this._selectedRole);
+        this._navigate(this._selected);
+      }),
+    );
+    root.querySelectorAll("[data-mode]").forEach((e) =>
+      e.addEventListener("click", () => {
+        this._mode = e.dataset.mode;
+        this._navigate(this._selected || "", false);
+        this.render();
+      }),
+    );
+    root.querySelectorAll("[data-crumb]").forEach((e) =>
+      e.addEventListener("click", () => {
+        const key = e.dataset.crumb;
+        if (key === "projects") {
+          this._project = "";
+          this._selectedRun = null;
+          this._selectedRole = null;
+          this._selectedInstance = null;
+          this._selected = null;
+        } else if (key === "project") {
+          this._selectedRun = null;
+          this._selectedRole = null;
+          this._selectedInstance = null;
+          this._selected = null;
+        } else if (key === "run") {
+          this._selectedRole = null;
+          this._selectedInstance = null;
+          this._selected = null;
+        } else if (key === "role") {
+          this._selectedInstance = null;
+          this._selected = null;
+        }
+        this._navigate("", false);
+        this.render();
+      }),
+    );
+    const loadMore = root.querySelector("#runsLoadMore");
+    if (loadMore)
+      loadMore.addEventListener("click", () => {
+        this._runLimit += 25;
+        this.render();
+      });
   }
 }
-
-customElements.define('cockpit-runs', CockpitRuns);
-
-export { CockpitRuns, normalizedBasePath, routePath };
+customElements.define("cockpit-runs", CockpitRuns);
+export { CockpitRuns, normalizedBasePath, routePath, scopeUrl };

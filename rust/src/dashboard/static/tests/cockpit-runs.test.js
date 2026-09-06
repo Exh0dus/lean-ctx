@@ -2,69 +2,34 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-
 const file = path.join(__dirname, '..', 'components', 'cockpit-runs.js');
-const source = fs.readFileSync(file, 'utf8').replace(
-  'export { CockpitRuns, normalizedBasePath, routePath };',
-  'globalThis.CockpitRuns = CockpitRuns; globalThis.normalizedBasePath = normalizedBasePath; globalThis.routePath = routePath;'
-);
-class HTMLElement {
-  constructor() { this.innerHTML = ''; this.style = {}; }
-  querySelector() { return null; }
-  querySelectorAll() { return []; }
-}
-const context = {
-  console, HTMLElement, customElements: { define() {} },
-  document: { body: { classList: { add() {}, remove() {}, toggle() {} } }, getElementById() { return null; } },
-  window: { location: { pathname: '/cockpit/', search: '?embed=1', hash: '' }, addEventListener() {}, removeEventListener() {}, LctxApi: { apiFetch() {} } },
-  setInterval() { return 1; }, clearInterval() {}, history: { pushState() {} },
-};
-context.globalThis = context;
-vm.runInNewContext(source, context, { filename: file });
-
+const source = fs.readFileSync(file, 'utf8').replace('export { CockpitRuns, normalizedBasePath, routePath, scopeUrl };', 'globalThis.CockpitRuns = CockpitRuns; globalThis.normalizedBasePath = normalizedBasePath; globalThis.routePath = routePath; globalThis.scopeUrl = scopeUrl;');
+class HTMLElement { constructor() { this.innerHTML = ''; this.style = {}; } querySelector() { return null; } querySelectorAll() { return []; } }
+const context = { console, URLSearchParams, HTMLElement, customElements: { define() {} }, document: { body: { classList: { add() {}, remove() {}, toggle() {} } }, getElementById() { return null; } }, window: { location: { pathname: '/cockpit/', search: '', hash: '' }, addEventListener() {}, removeEventListener() {}, LctxApi: { apiFetch() {} } }, setInterval() { return 1; }, clearInterval() {}, history: { pushState() {} } };
+context.globalThis = context; vm.runInNewContext(source, context, { filename: file });
 const namespace = 'a'.repeat(64);
 if (context.normalizedBasePath() !== '/cockpit') throw new Error('base path was not normalized');
 if (context.routePath(namespace) !== '/cockpit/runs/' + namespace) throw new Error('base path escaped');
-
-const runs = new context.CockpitRuns();
-runs._range = 7;
+if (context.scopeUrl('', { project: 'p', task: 't', role: 'implementer', mode: 'timeline' }, '?embed=1&foo=bar') !== '/cockpit/?embed=1&foo=bar&project=p&task=t&role=implementer&order=timeline') throw new Error('scope URL did not preserve query state');
+if (context.scopeUrl(namespace, { project: 'p', task: 't', role: 'implementer', mode: 'timeline' }, '?embed=1') !== '/cockpit/runs/' + namespace + '?embed=1&project=p&task=t&role=implementer&order=timeline') throw new Error('instance URL did not preserve hierarchy state');
+const runs = new context.CockpitRuns(); runs._range = 7;
 if (runs._apiPath('') !== '/cockpit/api/runs?days=7') throw new Error('range query missing');
-runs._range = 30;
-if (runs._apiPath(namespace) !== '/cockpit/api/runs/' + namespace + '?days=30') throw new Error('detail range query missing');
-runs._inflight = true;
-runs._onRangeChange({ detail: { days: 7 } });
-if (runs._range !== 7 || !runs._reloadPending || runs._reloadQuiet) {
-  throw new Error('range change did not queue a visible replacement load');
-}
-runs._inflight = false;
-runs._reloadPending = false;
-runs._reloadQuiet = true;
-runs._runs = [{ namespace, task_id: 'task-1', assignment_id: 'assignment-1', member_id: 'member-1',
-  status: 'active', metrics: { requests_total: 4, tokens_saved_total: 9,
-    tokens_processed: 12, source: 'live' } }];
-runs._aggregate = { total_runs: 1, tokens_saved_total: 9 };
-runs._enabled = true;
-runs._loading = false;
-runs.render();
-if (!runs.innerHTML.includes('7 days') || !runs.innerHTML.includes(namespace) ||
-    !runs.innerHTML.includes('<strong>1</strong><span>Runs</span>') ||
-    !runs.innerHTML.includes('active - live')) throw new Error('aggregate payload did not render');
-runs._detail = runs._runs[0];
-runs._selected = namespace;
-const detail = runs._detailView();
-if (!detail.includes('Requests') || !detail.includes('Tokens saved') ||
-    !detail.includes('Tokens processed') || !detail.includes('live')) throw new Error('canonical metrics missing');
-if (detail.includes('saved_tokens')) throw new Error('legacy metric alias leaked');
-
-runs._enabled = false;
-runs.render();
-if (!runs.innerHTML.includes('disabled') || runs.innerHTML.includes('All runs')) throw new Error('disabled state not distinct');
-
-runs._enabled = true;
-runs._selected = null;
-runs._runs = [];
-runs._aggregate = { total_runs: 0 };
-runs.render();
-if (!runs.innerHTML.includes('NO RUNS') || !runs.innerHTML.includes('Unavailable')) throw new Error('zero state not explicit');
-
-console.log('PASS: broker-run states, base paths, and canonical metrics');
+runs._inflight = true; runs._onRangeChange({ detail: { days: 30 } });
+if (runs._range !== 30 || !runs._reloadPending) throw new Error('range replacement load missing');
+runs._inflight = false; runs._reloadPending = false;
+runs._runs = [{ namespace, task_id: 'task-1', assignment_id: 'assignment-1', member_id: 'member-1', hierarchy: { metadata_available: true, project_id: 'project-1', project_label: 'Project One', role_label: 'implementer', timeline_rank: 2, timeline_source: "dispatch" }, status: 'active', metrics: { requests_total: 4, tokens_saved_total: 9, tokens_processed: 12 } }];
+runs._enabled = true; runs._loading = false; runs.render();
+if (!runs.innerHTML.includes('All projects') || !runs.innerHTML.includes('Project One')) throw new Error('project selector did not render');
+if (!runs.innerHTML.includes('data-range="7"') || !runs.innerHTML.includes('data-range="0"')) throw new Error('range controls did not render');
+runs._project = 'project-1'; runs._selectedRun = 'task-1'; runs._expandedRoles.add('implementer'); runs.render();
+if (!runs.innerHTML.includes('By role') || !runs.innerHTML.includes('Implementer') || !runs.innerHTML.includes('Implementer 01')) throw new Error('role hierarchy did not render');
+if (!runs._runRow({ id: 'task-1', rows: runs._runs, first: runs._runs[0] }).includes('task=task-1')) throw new Error('run new-tab action did not target task scope');
+if (runs._metrics(runs._runs).tokens_saved_total !== 9) throw new Error('scoped metrics did not aggregate');
+runs._selectedInstance = runs._runs[0];
+if (runs._metrics([runs._selectedInstance]).requests_total !== 4) throw new Error('instance scope was not exact');
+if (!runs._friendlyScopeLabel([runs._selectedInstance], 'Implementer instance').includes('Project One')) throw new Error('scope label omitted project');
+runs._mode = 'timeline'; runs.render();
+if (!runs.innerHTML.includes('Timeline') || !runs.innerHTML.includes('dispatch order')) throw new Error('timeline mode did not render');
+runs._enabled = false; runs.render();
+if (!runs.innerHTML.includes('disabled')) throw new Error('disabled state not distinct');
+console.log('PASS: project hierarchy, scoped metrics, role ledger, timeline, range, and disabled states');

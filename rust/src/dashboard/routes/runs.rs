@@ -12,6 +12,7 @@ use std::sync::{Mutex, OnceLock};
 const ROOT_ENV: &str = "LEANCTX_ASSIGNMENTD_ROOT";
 const MAX_BROKER_JSON: u64 = 2 * 1024 * 1024;
 const MAX_STATUS_JSON: u64 = 64 * 1024;
+const MAX_METADATA_JSON: u64 = 8 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_MEMBERS: usize = 4096;
 const NAMESPACE_LEN: usize = 64;
@@ -59,6 +60,68 @@ struct ArchiveInventory {
     path: PathBuf,
     sha256: String,
     archive_state: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DashboardMetadata {
+    #[serde(default)]
+    schema: u32,
+    #[serde(default)]
+    projects: HashMap<String, MetadataProject>,
+    #[serde(default)]
+    tasks: HashMap<String, MetadataTask>,
+    #[serde(default)]
+    assignments: HashMap<String, MetadataAssignment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataProject {
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataTask {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    project_label: Option<String>,
+    #[serde(default)]
+    workflow_key: Option<String>,
+    #[serde(default)]
+    workflow_label: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataAssignment {
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    parent_assignment_id: Option<String>,
+    #[serde(default)]
+    role_label: Option<String>,
+    #[serde(default)]
+    timeline_rank: Option<u64>,
+    #[serde(default)]
+    timeline_time: Option<String>,
+    #[serde(default)]
+    timeline_source: Option<String>,
+    #[serde(default)]
+    attempt_count: Option<u64>,
+    #[serde(default)]
+    attempt_status: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct LoadedMetadata {
+    digest: String,
+    document: DashboardMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +333,96 @@ fn configured_root() -> Result<PathBuf, DataError> {
 fn load_broker(root: &Path) -> Result<BrokerDocument, DataError> {
     let bytes = read_bounded_json(&root.join("broker.json"), MAX_BROKER_JSON)?;
     serde_json::from_slice(&bytes).map_err(|_| DataError::Malformed)
+}
+
+fn metadata_path(root: &Path) -> PathBuf {
+    std::env::var("LEAN_CTX_DASHBOARD_METADATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("dashboard-oms-metadata.json"))
+}
+
+fn load_metadata(root: &Path) -> LoadedMetadata {
+    let path = metadata_path(root);
+    let Ok(bytes) = read_bounded_json(&path, MAX_METADATA_JSON) else {
+        return LoadedMetadata {
+            digest: live_file_fingerprint(&path),
+            ..Default::default()
+        };
+    };
+    let digest = digest_bytes(&bytes);
+    let Ok(document) = serde_json::from_slice::<DashboardMetadata>(&bytes) else {
+        return LoadedMetadata {
+            digest: "malformed".to_string(),
+            ..Default::default()
+        };
+    };
+    if document.schema == 0 {
+        return LoadedMetadata {
+            digest: "malformed".to_string(),
+            ..Default::default()
+        };
+    }
+    LoadedMetadata { digest, document }
+}
+
+fn enrich_projection(
+    projection: &mut Value,
+    assignment: &Assignment,
+    metadata: &DashboardMetadata,
+) {
+    let Some(object) = projection.as_object_mut() else {
+        return;
+    };
+    let Some(task) = metadata.tasks.get(&assignment.task_id) else {
+        object.insert(
+            "hierarchy".to_string(),
+            json!({"metadata_available": false}),
+        );
+        return;
+    };
+    let Some(meta_assignment) =
+        metadata
+            .assignments
+            .get(&assignment.assignment_id)
+            .filter(|value| {
+                value
+                    .task_id
+                    .as_deref()
+                    .map_or(true, |task_id| task_id == assignment.task_id)
+            })
+    else {
+        object.insert(
+            "hierarchy".to_string(),
+            json!({"metadata_available": false}),
+        );
+        return;
+    };
+    let project_id = task.project_id.as_deref();
+    let project_label = task
+        .project_label
+        .as_deref()
+        .or_else(|| project_id.and_then(|id| metadata.projects.get(id).map(|p| p.label.as_str())));
+    object.insert(
+        "hierarchy".to_string(),
+        json!({
+            "metadata_available": true,
+            "project_id": project_id,
+            "project_label": project_label,
+            "workflow_key": task.workflow_key.as_deref(),
+            "workflow_label": task.workflow_label.as_deref(),
+            "run_label": task.workflow_label.as_deref(),
+            "run_status": task.status.as_deref(),
+            "run_created_at": task.created_at.as_deref(),
+            "run_updated_at": task.updated_at.as_deref(),
+            "role_label": meta_assignment.role_label.as_deref(),
+            "parent_assignment_id": meta_assignment.parent_assignment_id.as_deref(),
+            "timeline_rank": meta_assignment.timeline_rank,
+            "timeline_time": meta_assignment.timeline_time.as_deref(),
+            "timeline_source": meta_assignment.timeline_source.as_deref(),
+            "attempt_count": meta_assignment.attempt_count,
+            "attempt_status": meta_assignment.attempt_status.as_deref()
+        }),
+    );
 }
 
 fn read_bounded_json(path: &Path, limit: u64) -> Result<Vec<u8>, DataError> {
@@ -556,11 +709,12 @@ fn aggregate_from_projection(value: &Value, aggregate: &mut Aggregate) {
     );
 }
 
-fn rolling_chain(window: RunWindow, keys: &[String]) -> String {
+fn rolling_chain(window: RunWindow, metadata_digest: &str, keys: &[String]) -> String {
     let mut chain = digest_text(&format!(
         "leanctx-runs-v{CACHE_SCHEMA}|{}|{}",
         window.days, window.cutoff_day
     ));
+    chain = digest_bytes(format!("{chain}{metadata_digest}").as_bytes());
     for key in keys {
         chain = digest_bytes(format!("{chain}{key}").as_bytes());
     }
@@ -574,6 +728,7 @@ fn list_runs(window: RunWindow) -> Result<Value, DataError> {
         .map_err(|_| DataError::Unavailable)?;
     let root = configured_root()?;
     let broker = load_broker(&root)?;
+    let metadata = load_metadata(&root);
     let mut assignments: Vec<(&String, &Assignment)> = broker.assignments.iter().collect();
     assignments.sort_by(|left, right| left.0.cmp(right.0));
     let mut runs = Vec::with_capacity(assignments.len());
@@ -607,11 +762,13 @@ fn list_runs(window: RunWindow) -> Result<Value, DataError> {
                 .map_err(|_| DataError::Malformed)?,
         };
         let (key, projection, _) = cache_projection(&root, &fingerprint, Some(projection));
+        let mut projection = projection;
+        enrich_projection(&mut projection, assignment, &metadata.document);
         aggregate_from_projection(&projection, &mut aggregate);
         run_keys.push(key);
         runs.push(projection);
     }
-    let chain = rolling_chain(window, &run_keys);
+    let chain = rolling_chain(window, &metadata.digest, &run_keys);
     let cache_path = cache_dir(&root).join(format!("aggregate-{chain}.json"));
     let cached_response = if let Some(bytes) = bounded_cache_read(&cache_path) {
         serde_json::from_slice::<AggregateCacheFile>(&bytes)
@@ -665,6 +822,7 @@ fn list_runs(window: RunWindow) -> Result<Value, DataError> {
 fn run_detail(namespace: &str) -> Result<Value, DataError> {
     let root = configured_root()?;
     let broker = load_broker(&root)?;
+    let metadata = load_metadata(&root);
     let assignment = broker
         .assignments
         .get(namespace)
@@ -687,7 +845,8 @@ fn run_detail(namespace: &str) -> Result<Value, DataError> {
                     == Some(file.projection_sha256.as_str())
         })
         .map(|file| file.projection);
-    if let Some(cached) = cached {
+    if let Some(mut cached) = cached {
+        enrich_projection(&mut cached, assignment, &metadata.document);
         return Ok(cached);
     }
     let (_, projection, _) = cache_projection(
@@ -697,6 +856,8 @@ fn run_detail(namespace: &str) -> Result<Value, DataError> {
             .map_err(|_| DataError::Malformed)
             .ok(),
     );
+    let mut projection = projection;
+    enrich_projection(&mut projection, assignment, &metadata.document);
     Ok(projection)
 }
 
@@ -1098,6 +1259,116 @@ mod tests {
                 archive_state: "available".to_string(),
             },
         )
+    }
+
+    #[test]
+    fn metadata_enrichment_allowlists_hierarchy_and_unmatched_fallback() {
+        let metadata = DashboardMetadata {
+            schema: 1,
+            projects: HashMap::from([(
+                "p1".to_string(),
+                MetadataProject {
+                    label: "Workspace".to_string(),
+                },
+            )]),
+            tasks: HashMap::from([(
+                "task-safe".to_string(),
+                MetadataTask {
+                    project_id: Some("p1".to_string()),
+                    project_label: Some("Workspace".to_string()),
+                    workflow_key: Some("workflow-key".to_string()),
+                    workflow_label: Some("Human workflow".to_string()),
+                    status: Some("completed".to_string()),
+                    created_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    updated_at: None,
+                },
+            )]),
+            assignments: HashMap::from([(
+                "assignment-safe".to_string(),
+                MetadataAssignment {
+                    task_id: Some("task-safe".to_string()),
+                    parent_assignment_id: None,
+                    role_label: Some("Implementer".to_string()),
+                    timeline_rank: Some(2),
+                    timeline_time: Some("2026-01-01T00:01:00Z".to_string()),
+                    timeline_source: Some("dispatch".to_string()),
+                    attempt_count: Some(1),
+                    attempt_status: Some("completed".to_string()),
+                },
+            )]),
+        };
+        let matched_assignment = assignment("active");
+        let mut value = json!({"namespace": NS});
+        enrich_projection(&mut value, &matched_assignment, &metadata);
+        assert_eq!(value["hierarchy"]["project_label"], "Workspace");
+        assert_eq!(value["hierarchy"]["timeline_rank"], 2);
+        let keys: std::collections::HashSet<&str> = value["hierarchy"]
+            .as_object()
+            .expect("hierarchy object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: std::collections::HashSet<&str> = [
+            "metadata_available",
+            "project_id",
+            "project_label",
+            "workflow_key",
+            "workflow_label",
+            "run_label",
+            "run_status",
+            "run_created_at",
+            "run_updated_at",
+            "role_label",
+            "parent_assignment_id",
+            "timeline_rank",
+            "timeline_time",
+            "timeline_source",
+            "attempt_count",
+            "attempt_status",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+        let hierarchy_text = value["hierarchy"].to_string();
+        assert!(!hierarchy_text.contains("prompt"));
+        assert!(!hierarchy_text.contains("token"));
+        assert!(!hierarchy_text.contains("/home/"));
+        let mut unmatched = json!({});
+        let mut other = assignment("active");
+        other.task_id = "unknown".to_string();
+        enrich_projection(&mut unmatched, &other, &metadata);
+        assert_eq!(unmatched["hierarchy"]["metadata_available"], false);
+        assert!(!unmatched.to_string().contains("Workspace"));
+    }
+
+    #[test]
+    fn metadata_digest_invalidates_aggregate_chain() {
+        let window = RunWindow {
+            days: 30,
+            cutoff_day: 10,
+        };
+        let keys = vec!["run-key".to_string()];
+        assert_ne!(
+            rolling_chain(window, "missing", &keys),
+            rolling_chain(window, "changed", &keys)
+        );
+    }
+
+    #[test]
+    fn metadata_file_is_bounded_and_symlink_safe() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let path = td.path().join("metadata.json");
+        std::fs::write(&path, br#"{"schema":1,"tasks":{}}"#).expect("write");
+        let bytes = read_bounded_json(&path, MAX_METADATA_JSON).expect("bounded");
+        assert!(!bytes.is_empty());
+        let link = td.path().join("link.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&path, &link).expect("symlink");
+        #[cfg(unix)]
+        assert_eq!(
+            read_bounded_json(&link, MAX_METADATA_JSON).unwrap_err(),
+            DataError::Malformed
+        );
     }
 
     #[test]

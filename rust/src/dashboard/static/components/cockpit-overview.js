@@ -54,6 +54,14 @@ class CockpitOverview extends HTMLElement {
     this._data = null;
     this._error = null;
     this._loading = true;
+    this._runScope = null;
+  }
+
+  setRunScope(scope) {
+    this._runScope = scope || null;
+    this._loading = false;
+    this._error = null;
+    this.render();
   }
 
   connectedCallback() {
@@ -190,6 +198,11 @@ class CockpitOverview extends HTMLElement {
     var pc = F.pc || function (a, b) { return b > 0 ? Math.round((a / b) * 100) : 0; };
     var fu = F.fu || function (a) { return '$' + Number(a).toFixed(2); };
 
+    if (this._runScope) {
+      this.innerHTML = this._renderRunScope(this._runScope);
+      return;
+    }
+
     if (this._loading) {
       this.innerHTML =
         '<div class="card"><div class="loading-state">Loading overview\u2026</div></div>';
@@ -220,6 +233,33 @@ class CockpitOverview extends HTMLElement {
     this._bind();
     this._bindContextHealthCard();
     this._bindVerifiedBridge();
+  }
+
+  _renderRunScope(scope) {
+    var esc = (window.LctxFmt && window.LctxFmt.esc) || function (s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; });
+    };
+    var metrics = scope.metrics || {};
+    var cards = [['requests_total', 'Requests'], ['tokens_saved_total', 'Tokens saved'],
+      ['bytes_compressed', 'Bytes compressed'], ['tokens_processed', 'Tokens processed']];
+    function value(v) {
+      if (v === undefined || v === null || v === '' || (v && v.available === false)) return 'Unavailable';
+      return esc(typeof v === 'object' && v.value !== undefined ? v.value : v);
+    }
+    var rows = scope.rows || [];
+    var logicalRuns = {};
+    rows.forEach(function (row) { logicalRuns[row.task_id || row.namespace || String(row)] = true; });
+    var availableMetrics = cards.filter(function (item) {
+      var value = metrics[item[0]];
+      return value !== undefined && value !== null && value !== '' && !(value && value.available === false);
+    }).length;
+    return '<section class="runs-scoped-overview" aria-live="polite"><div class="runs-scoped-head">' +
+      '<div><p class="eyebrow">OVERVIEW · ' + esc(scope.interval || 'Selected interval') + '</p><h2>' +
+      esc(scope.label || 'Selected scope') + '</h2><p class="hs">Lifetime totals for assignments admitted by this interval.</p></div>' +
+      '<span class="runs-scope-count">' + Object.keys(logicalRuns).length + ' runs · ' + rows.length + ' assignments<br><small>' + availableMetrics + '/' + cards.length + ' metrics available</small></span></div>' +
+      '<div class="runs-scoped-grid">' + cards.map(function (item) {
+        return '<div class="runs-scoped-card"><span class="eyebrow">' + item[1] + '</span><strong>' + value(metrics[item[0]]) + '</strong></div>';
+      }).join('') + '</div></section>';
   }
 
   /* ── Time filter bar ───────────────────────────────── */
