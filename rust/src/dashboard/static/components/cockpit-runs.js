@@ -5,9 +5,7 @@ const METRIC_KEYS = [
   ['requests_total', 'Requests'],
   ['tokens_saved_total', 'Tokens saved'],
   ['bytes_compressed', 'Bytes compressed'],
-  ['input_tokens_total', 'Input tokens'],
-  ['cache_read_tokens_total', 'Cache-read tokens'],
-  ['cache_write_tokens_total', 'Cache-write tokens'],
+  ['tokens_processed', 'Tokens processed'],
 ];
 
 function runsApi() {
@@ -228,7 +226,7 @@ class CockpitRuns extends HTMLElement {
 
   _aggregateView() {
     const aggregate = this._aggregate || {};
-    const runCount = metric(aggregate, 'runs');
+    const runCount = metric(aggregate, 'total_runs');
     let html = '<div class="runs-overview-head"><div><p class="eyebrow">BROKER RUNS</p>' +
       '<h2>All runs</h2><p class="hs">Historical and active LeanCtx assignment runs.</p>' +
       '</div><div class="runs-totals"><div><strong>' +
@@ -250,7 +248,8 @@ class CockpitRuns extends HTMLElement {
       escapeHtml(namespace) + '"><span class="runs-row-main"><strong>' +
       escapeHtml(this._label(run)) + '</strong><small>' +
       escapeHtml(run.status || 'Unavailable') + ' - ' +
-      escapeHtml(run.source || 'Unavailable') + '</small></span><span class="runs-row-metric">' +
+      escapeHtml(metric(run.metrics, 'source') || 'Unavailable') +
+      '</small></span><span class="runs-row-metric">' +
       displayValue(metric(run.metrics, 'tokens_saved_total')) +
       '</span><span class="runs-row-arrow" aria-hidden="true">&rarr;</span></button>';
   }
@@ -268,7 +267,7 @@ class CockpitRuns extends HTMLElement {
       '<h2>' + escapeHtml(this._label(run)) + '</h2><p class="hs">Namespace <code>' +
       escapeHtml(this._selected) + '</code></p></div><button type="button" class="runs-back" ' +
       'id="runsBack">&larr; All runs</button></div><div class="runs-detail-grid">' +
-      this._card('Status', run.status) + this._card('Source', run.source);
+      this._card('Status', run.status) + this._card('Source', metrics.source);
     METRIC_KEYS.forEach(([key, label]) => {
       if (Object.prototype.hasOwnProperty.call(metrics, key)) {
         html += this._card(label, metric(metrics, key));

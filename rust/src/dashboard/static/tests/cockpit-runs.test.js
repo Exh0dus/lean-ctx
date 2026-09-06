@@ -28,16 +28,20 @@ if (context.routePath(namespace) !== '/cockpit/runs/' + namespace) throw new Err
 
 const runs = new context.CockpitRuns();
 runs._runs = [{ namespace, task_id: 'task-1', assignment_id: 'assignment-1', member_id: 'member-1',
-  status: 'active', source: 'broker', metrics: { requests_total: 4, tokens_saved_total: 9 } }];
-runs._aggregate = { runs: 1, tokens_saved_total: 9 };
+  status: 'active', metrics: { requests_total: 4, tokens_saved_total: 9,
+    tokens_processed: 12, source: 'live' } }];
+runs._aggregate = { total_runs: 1, tokens_saved_total: 9 };
 runs._enabled = true;
 runs._loading = false;
 runs.render();
-if (!runs.innerHTML.includes('All runs') || !runs.innerHTML.includes(namespace)) throw new Error('selector did not populate');
+if (!runs.innerHTML.includes('All runs') || !runs.innerHTML.includes(namespace) ||
+    !runs.innerHTML.includes('<strong>1</strong><span>Runs</span>') ||
+    !runs.innerHTML.includes('active - live')) throw new Error('aggregate payload did not render');
 runs._detail = runs._runs[0];
 runs._selected = namespace;
 const detail = runs._detailView();
-if (!detail.includes('Requests') || !detail.includes('Tokens saved')) throw new Error('canonical metrics missing');
+if (!detail.includes('Requests') || !detail.includes('Tokens saved') ||
+    !detail.includes('Tokens processed') || !detail.includes('live')) throw new Error('canonical metrics missing');
 if (detail.includes('saved_tokens')) throw new Error('legacy metric alias leaked');
 
 runs._enabled = false;
@@ -47,7 +51,7 @@ if (!runs.innerHTML.includes('disabled') || runs.innerHTML.includes('All runs'))
 runs._enabled = true;
 runs._selected = null;
 runs._runs = [];
-runs._aggregate = { runs: 0 };
+runs._aggregate = { total_runs: 0 };
 runs.render();
 if (!runs.innerHTML.includes('NO RUNS') || !runs.innerHTML.includes('Unavailable')) throw new Error('zero state not explicit');
 
